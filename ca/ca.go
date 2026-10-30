@@ -621,7 +621,9 @@ func (ca *CA) getTLSConfig(auth *authority.Authority) (*tls.Config, *tls.Config,
 		ca.renewer.Stop()
 	}
 
-	ca.renewer, err = NewTLSRenewer(tlsCrt, auth.GetTLSCertificate)
+	ca.renewer, err = NewTLSRenewer(tlsCrt, func(context.Context) (*tls.Certificate, error) {
+		return auth.GetTLSCertificate()
+	})
 	if err != nil {
 		return nil, nil, err
 	}

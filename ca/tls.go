@@ -340,7 +340,7 @@ func getDefaultTransport(tlsConfig *tls.Config) *http.Transport {
 }
 
 func getRenewFunc(ctx *TLSOptionCtx, client *Client, tr http.RoundTripper, pk crypto.PrivateKey) RenewFunc {
-	return func() (*tls.Certificate, error) {
+	return func(renewCtx context.Context) (*tls.Certificate, error) {
 		// Close connections in keep-alive state
 		defer client.CloseIdleConnections()
 
@@ -349,7 +349,7 @@ func getRenewFunc(ctx *TLSOptionCtx, client *Client, tr http.RoundTripper, pk cr
 			return nil, err
 		}
 		// Get new certificate
-		sign, err := client.Renew(tr)
+		sign, err := client.RenewWithContext(renewCtx, tr)
 		if err != nil {
 			return nil, err
 		}
