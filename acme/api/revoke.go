@@ -106,16 +106,6 @@ func RevokeCert(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ca := mustAuthority(ctx)
-	hasBeenRevokedBefore, err := ca.IsRevoked(serial)
-	if err != nil {
-		render.Error(w, r, acme.WrapErrorISE(err, "error retrieving revocation status of certificate"))
-		return
-	}
-
-	if hasBeenRevokedBefore {
-		render.Error(w, r, acme.NewError(acme.ErrorAlreadyRevokedType, "certificate was already revoked"))
-		return
-	}
 
 	reasonCode := p.ReasonCode
 	acmeErr := validateReasonCode(reasonCode)
@@ -132,9 +122,12 @@ func RevokeCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	options := revokeOptions(serial, certToBeRevoked, reasonCode)
-	err = ca.Revoke(ctx, options)
-	if err != nil {
+	// Revocation is idempotent: a certificate that was already revoked (possibly
+	// through another entry or in a concurrent request) is reported as
+	// successfully revoked again without overwriting the first revocation. The
+	// authorization checks above are still performed for every request.
+	options := revokeOptions(serial, certToBeRevoked, reasonCode, revocationSource(jws))
+	if _, _, err := ca.Revoke(ctx, options); err != nil {
 		render.Error(w, r, wrapRevokeErr(err))
 		return
 	}
@@ -237,17 +230,27 @@ func validateReasonCode(reasonCode *int) *acme.Error {
 }
 
 // revokeOptions determines the RevokeOptions for the Authority to use in revocation
-func revokeOptions(serial string, certToBeRevoked *x509.Certificate, reasonCode *int) *authority.RevokeOptions {
+func revokeOptions(serial string, certToBeRevoked *x509.Certificate, reasonCode *int, source string) *authority.RevokeOptions {
 	opts := &authority.RevokeOptions{
 		Serial: serial,
 		ACME:   true,
 		Crt:    certToBeRevoked,
+		Source: source,
 	}
 	if reasonCode != nil { // NOTE: when implementing CRL and/or OCSP, and reason code is missing, CRL entry extension should be omitted
 		opts.Reason = reason(*reasonCode)
 		opts.ReasonCode = *reasonCode
 	}
 	return opts
+}
+
+// revocationSource determines the entry through which the ACME revocation is
+// requested: an ACME account key or the certificate's own private key.
+func revocationSource(jws *jose.JSONWebSignature) string {
+	if shouldCheckAccountFrom(jws) {
+		return authority.RevocationSourceACMEAccountKey
+	}
+	return authority.RevocationSourceACMECertificateKey
 }
 
 // reason transforms an integer reason code to a

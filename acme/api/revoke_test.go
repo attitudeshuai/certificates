@@ -34,6 +34,7 @@ import (
 	"github.com/smallstep/certificates/acme"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 )
 
 // v is a utility function to return the pointer to an integer
@@ -299,11 +300,13 @@ func (m *mockCA) IsRevoked(sn string) (bool, error) {
 	return false, nil
 }
 
-func (m *mockCA) Revoke(ctx context.Context, opts *authority.RevokeOptions) error {
+func (m *mockCA) Revoke(ctx context.Context, opts *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error) {
 	if m.MockRevoke != nil {
-		return m.MockRevoke(ctx, opts)
+		if err := m.MockRevoke(ctx, opts); err != nil {
+			return nil, false, err
+		}
 	}
-	return nil
+	return nil, false, nil
 }
 
 func (m *mockCA) LoadProvisionerByName(string) (provisioner.Interface, error) {
@@ -456,6 +459,7 @@ func Test_revokeOptions(t *testing.T) {
 				Serial: "1234",
 				Crt:    cert,
 				ACME:   true,
+				Source: authority.RevocationSourceACMEAccountKey,
 			},
 		},
 		{
@@ -471,12 +475,13 @@ func Test_revokeOptions(t *testing.T) {
 				ACME:       true,
 				ReasonCode: 1,
 				Reason:     "key compromised",
+				Source:     authority.RevocationSourceACMEAccountKey,
 			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := revokeOptions(tt.args.serial, tt.args.certToBeRevoked, tt.args.reasonCode); !cmp.Equal(got, tt.want) {
+			if got := revokeOptions(tt.args.serial, tt.args.certToBeRevoked, tt.args.reasonCode, authority.RevocationSourceACMEAccountKey); !cmp.Equal(got, tt.want) {
 				t.Errorf("revokeOptions() diff =\n%s", cmp.Diff(got, tt.want))
 			}
 		})
@@ -819,7 +824,9 @@ func TestHandler_RevokeCert(t *testing.T) {
 				err:        acmeErr,
 			}
 		},
-		"fail/certificate-revoked-check-fails": func(t *testing.T) test {
+		"ok/already-revoked": func(t *testing.T) test {
+			// revocation is idempotent: an already revoked certificate is
+			// revoked successfully again (authorization is still checked)
 			acc := &acme.Account{ID: "accountID", Status: acme.StatusValid}
 			ctx := acme.NewProvisionerContext(context.Background(), prov)
 			ctx = context.WithValue(ctx, accContextKey, acc)
@@ -836,52 +843,16 @@ func TestHandler_RevokeCert(t *testing.T) {
 				},
 			}
 			ca := &mockCA{
-				MockIsRevoked: func(sn string) (bool, error) {
-					return false, errors.New("force")
+				MockRevoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
+					assert.Equals(t, authority.RevocationSourceACMEAccountKey, opts.Source)
+					return nil
 				},
 			}
 			return test{
 				db:         db,
 				ca:         ca,
 				ctx:        ctx,
-				statusCode: 500,
-				err: &acme.Error{
-					Type:   "urn:ietf:params:acme:error:serverInternal",
-					Detail: "The server experienced an internal error",
-					Status: 500,
-				},
-			}
-		},
-		"fail/certificate-already-revoked": func(t *testing.T) test {
-			acc := &acme.Account{ID: "accountID", Status: acme.StatusValid}
-			ctx := acme.NewProvisionerContext(context.Background(), prov)
-			ctx = context.WithValue(ctx, accContextKey, acc)
-			ctx = context.WithValue(ctx, payloadContextKey, &payloadInfo{value: payloadBytes})
-			ctx = context.WithValue(ctx, jwsContextKey, jws)
-			db := &acme.MockDB{
-				MockGetCertificateBySerial: func(ctx context.Context, serial string) (*acme.Certificate, error) {
-					assert.Equals(t, cert.SerialNumber.String(), serial)
-					return &acme.Certificate{
-						AccountID: "accountID",
-						Leaf:      cert,
-					}, nil
-				},
-			}
-			ca := &mockCA{
-				MockIsRevoked: func(sn string) (bool, error) {
-					return true, nil
-				},
-			}
-			return test{
-				db:         db,
-				ca:         ca,
-				ctx:        ctx,
-				statusCode: 400,
-				err: &acme.Error{
-					Type:   "urn:ietf:params:acme:error:alreadyRevoked",
-					Detail: "Certificate already revoked",
-					Status: 400,
-				},
+				statusCode: 200,
 			}
 		},
 		"fail/invalid-reasoncode": func(t *testing.T) test {
@@ -1039,7 +1010,12 @@ func TestHandler_RevokeCert(t *testing.T) {
 					}, nil
 				},
 			}
-			ca := &mockCA{}
+			ca := &mockCA{
+				MockRevoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
+					assert.Equals(t, authority.RevocationSourceACMEAccountKey, opts.Source)
+					return nil
+				},
+			}
 			return test{
 				db:         db,
 				ca:         ca,
@@ -1065,7 +1041,12 @@ func TestHandler_RevokeCert(t *testing.T) {
 					}, nil
 				},
 			}
-			ca := &mockCA{}
+			ca := &mockCA{
+				MockRevoke: func(ctx context.Context, opts *authority.RevokeOptions) error {
+					assert.Equals(t, authority.RevocationSourceACMECertificateKey, opts.Source)
+					return nil
+				},
+			}
 			return test{
 				db:         db,
 				ca:         ca,

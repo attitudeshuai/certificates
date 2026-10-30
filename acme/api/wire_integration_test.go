@@ -28,6 +28,7 @@ import (
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/authority/provisioner/wire"
+	"github.com/smallstep/certificates/db"
 	nosqlDB "github.com/smallstep/nosql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -678,8 +679,8 @@ func (m *mockCASigner) IsRevoked(sn string) (bool, error) {
 	return false, nil
 }
 
-func (m *mockCASigner) Revoke(ctx context.Context, opts *authority.RevokeOptions) error {
-	return nil
+func (m *mockCASigner) Revoke(ctx context.Context, opts *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error) {
+	return nil, false, nil
 }
 
 func (m *mockCASigner) LoadProvisionerByName(string) (provisioner.Interface, error) {

@@ -19,6 +19,7 @@ import (
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/webhook"
 	"go.step.sm/crypto/keyutil"
@@ -307,8 +308,8 @@ func (m *mockSignAuth) IsRevoked(string) (bool, error) {
 	return false, nil
 }
 
-func (m *mockSignAuth) Revoke(context.Context, *authority.RevokeOptions) error {
-	return nil
+func (m *mockSignAuth) Revoke(context.Context, *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error) {
+	return nil, false, nil
 }
 
 func (m *mockSignAuth) GetBackdate() *time.Duration {

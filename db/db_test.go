@@ -3,10 +3,13 @@ package db
 import (
 	"bytes"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
@@ -97,6 +100,159 @@ func TestRevoke(t *testing.T) {
 				assert.Nil(t, tc.err)
 			}
 		})
+	}
+}
+
+func TestGetRevokedCertificate(t *testing.T) {
+	revokedAt := time.Now().UTC()
+	first := &RevokedCertificateInfo{
+		Serial:     "sn",
+		ReasonCode: 1,
+		Reason:     "key compromised",
+		RevokedAt:  revokedAt,
+		Source:     "mtls",
+	}
+	firstb, err := json.Marshal(first)
+	assert.FatalError(t, err)
+
+	// an old record without a source marker must still unmarshal
+	oldb := []byte(`{"Serial":"old-sn","ReasonCode":2,"Reason":"superseded","RevokedAt":"2020-01-01T00:00:00Z"}`)
+
+	tests := map[string]struct {
+		db       *DB
+		rci      *RevokedCertificateInfo
+		err      error
+		notFound bool
+	}{
+		"ok": {
+			db:  &DB{&MockNoSQLDB{MGet: func(bucket, key []byte) ([]byte, error) { return firstb, nil }}, true},
+			rci: first,
+		},
+		"ok/old-record-without-source": {
+			db: &DB{&MockNoSQLDB{MGet: func(bucket, key []byte) ([]byte, error) { return oldb, nil }}, true},
+			rci: &RevokedCertificateInfo{
+				Serial:     "old-sn",
+				ReasonCode: 2,
+				Reason:     "superseded",
+				RevokedAt:  time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+			},
+		},
+		"fail/not-found": {
+			db:       &DB{&MockNoSQLDB{MGet: func(bucket, key []byte) ([]byte, error) { return nil, database.ErrNotFound }}, true},
+			notFound: true,
+			err:      database.ErrNotFound,
+		},
+		"fail/storage": {
+			db:  &DB{&MockNoSQLDB{MGet: func(bucket, key []byte) ([]byte, error) { return nil, errors.New("force") }}, true},
+			err: errors.New("error getting revoked certificate: force"),
+		},
+		"fail/unmarshal": {
+			db:  &DB{&MockNoSQLDB{MGet: func(bucket, key []byte) ([]byte, error) { return []byte("{"), nil }}, true},
+			err: errors.New("error unmarshaling revoked certificate info: unexpected end of JSON input"),
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			rci, err := tc.db.GetRevokedCertificate("sn")
+			if err != nil {
+				if assert.NotNil(t, tc.err) {
+					assert.HasPrefix(t, tc.err.Error(), err.Error())
+					assert.Equals(t, tc.notFound, errors.Is(err, database.ErrNotFound))
+				}
+				return
+			}
+			assert.Nil(t, tc.err)
+			assert.Equals(t, tc.rci.Serial, rci.Serial)
+			assert.Equals(t, tc.rci.ReasonCode, rci.ReasonCode)
+			assert.Equals(t, tc.rci.Reason, rci.Reason)
+			assert.Equals(t, tc.rci.Source, rci.Source)
+		})
+	}
+}
+
+func TestRevoke_concurrent(t *testing.T) {
+	// A compare-and-swap based store shared by concurrent revocations:
+	// exactly one write per serial must succeed, repeated reads return the
+	// first record.
+	var mu sync.Mutex
+	store := map[string][]byte{}
+	d := &DB{&MockNoSQLDB{
+		MCmpAndSwap: func(bucket, key, old, newval []byte) ([]byte, bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			k := string(key)
+			v, ok := store[k]
+			switch {
+			case old == nil:
+				if ok {
+					return v, false, nil
+				}
+				store[k] = newval
+				return newval, true, nil
+			case bytes.Equal(v, old):
+				store[k] = newval
+				return newval, true, nil
+			default:
+				return v, false, nil
+			}
+		},
+		MGet: func(bucket, key []byte) ([]byte, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			v, ok := store[string(key)]
+			if !ok {
+				return nil, database.ErrNotFound
+			}
+			return v, nil
+		},
+	}, true}
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := range n {
+		wg.Add(1)
+		go func(rc int) {
+			defer wg.Done()
+			errs <- d.Revoke(&RevokedCertificateInfo{
+				Serial:     "sn",
+				ReasonCode: rc,
+				Reason:     "a repeated revocation",
+				RevokedAt:  time.Now().UTC(),
+				Source:     "token",
+			})
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+
+	var written, conflicts int
+	for err := range errs {
+		switch {
+		case err == nil:
+			written++
+		case errors.Is(err, ErrAlreadyExists):
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	assert.Equals(t, 1, written)
+	assert.Equals(t, n-1, conflicts)
+
+	mu.Lock()
+	assert.Equals(t, 1, len(store))
+	mu.Unlock()
+
+	// every read returns the same first revocation record
+	rci, err := d.GetRevokedCertificate("sn")
+	assert.FatalError(t, err)
+	for range n {
+		got, err := d.GetRevokedCertificate("sn")
+		assert.FatalError(t, err)
+		assert.Equals(t, rci.RevokedAt, got.RevokedAt)
+		assert.Equals(t, rci.ReasonCode, got.ReasonCode)
+		assert.Equals(t, rci.Source, got.Source)
 	}
 }
 

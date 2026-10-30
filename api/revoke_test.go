@@ -11,12 +11,14 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
 )
@@ -121,10 +123,68 @@ func Test_caHandler_Revoke(t *testing.T) {
 						assert.Equals(t, opts.Serial, "10")
 						assert.Equals(t, opts.ReasonCode, 4)
 						assert.Equals(t, opts.Reason, "foo")
+						assert.Equals(t, opts.Source, authority.RevocationSourceToken)
 						return nil
 					},
 				},
 				expected: []byte(`{"status":"ok"}`),
+			}
+		},
+		"200/already-revoked": func(t *testing.T) test {
+			input, err := json.Marshal(RevokeRequest{
+				Serial:     "10",
+				ReasonCode: 4,
+				Reason:     "foo",
+				OTT:        "valid",
+				Passive:    true,
+			})
+			assert.FatalError(t, err)
+			firstRevokedAt := time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC)
+			return test{
+				input:      string(input),
+				statusCode: http.StatusOK,
+				auth: &mockAuthority{
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revokedCertificate: &db.RevokedCertificateInfo{
+						Serial:     "10",
+						ReasonCode: 1,
+						Reason:     "key compromised",
+						RevokedAt:  firstRevokedAt,
+						Source:     authority.RevocationSourceMTLS,
+					},
+					alreadyRevoked: true,
+				},
+				expected: []byte(`{"status":"ok","revokedAt":"2020-01-01T00:00:00Z","reasonCode":1,"source":"mtls"}`),
+			}
+		},
+		"200/already-revoked-unknown-source": func(t *testing.T) test {
+			input, err := json.Marshal(RevokeRequest{
+				Serial:     "10",
+				ReasonCode: 4,
+				Reason:     "foo",
+				OTT:        "valid",
+				Passive:    true,
+			})
+			assert.FatalError(t, err)
+			return test{
+				input:      string(input),
+				statusCode: http.StatusOK,
+				auth: &mockAuthority{
+					authorize: func(ctx context.Context, ott string) ([]provisioner.SignOption, error) {
+						return nil, nil
+					},
+					revokedCertificate: &db.RevokedCertificateInfo{
+						Serial:    "10",
+						RevokedAt: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
+						// the authority reports records without a source marker
+						// as unknown
+						Source: authority.RevocationSourceUnknown,
+					},
+					alreadyRevoked: true,
+				},
+				expected: []byte(`{"status":"ok","revokedAt":"2020-01-01T00:00:00Z","reasonCode":0,"source":"unknown"}`),
 			}
 		},
 		"400/no OTT and no peer certificate": func(t *testing.T) test {
@@ -165,6 +225,7 @@ func Test_caHandler_Revoke(t *testing.T) {
 						assert.Equals(t, ri.Serial, "1404354960355712309")
 						assert.Equals(t, ri.ReasonCode, 4)
 						assert.Equals(t, ri.Reason, "foo")
+						assert.Equals(t, ri.Source, authority.RevocationSourceMTLS)
 						return nil
 					},
 					loadProvisionerByCertificate: func(crt *x509.Certificate) (provisioner.Interface, error) {

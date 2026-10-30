@@ -58,6 +58,7 @@ type AuthDB interface {
 	IsSSHRevoked(sn string) (bool, error)
 	Revoke(rci *RevokedCertificateInfo) error
 	RevokeSSH(rci *RevokedCertificateInfo) error
+	GetRevokedCertificate(serialNumber string) (*RevokedCertificateInfo, error)
 	GetCertificate(serialNumber string) (*x509.Certificate, error)
 	UseToken(id, tok string) (bool, error)
 	IsSSHHost(name string) (bool, error)
@@ -155,6 +156,13 @@ type RevokedCertificateInfo struct {
 	TokenID       string
 	MTLS          bool
 	ACME          bool
+
+	// Source records the entry through which the certificate was revoked
+	// for the first time (e.g. a provisioner token, the certificate itself
+	// over mTLS or an ACME account/certificate key). It is only set by
+	// recent versions; records missing the value must be treated as having
+	// an unknown source.
+	Source string `json:"Source,omitempty"`
 }
 
 // CertificateRevocationListInfo contains a CRL in DER format and associated
@@ -246,6 +254,28 @@ func (db *DB) RevokeSSH(rci *RevokedCertificateInfo) error {
 	default:
 		return nil
 	}
+}
+
+// GetRevokedCertificate returns the information stored when the certificate
+// with the given serial number was revoked for the first time.
+//
+// It returns database.ErrNotFound if the certificate has not been revoked.
+// It does not return an ErrAlreadyExists error or anything similar, so that
+// callers can use the returned record to make repeated revocation idempotent.
+func (db *DB) GetRevokedCertificate(serialNumber string) (*RevokedCertificateInfo, error) {
+	b, err := db.Get(revokedCertsTable, []byte(serialNumber))
+	if err != nil {
+		if nosql.IsErrNotFound(err) {
+			return nil, database.ErrNotFound
+		}
+		return nil, errors.Wrap(err, "error getting revoked certificate")
+	}
+
+	var rci RevokedCertificateInfo
+	if err := json.Unmarshal(b, &rci); err != nil {
+		return nil, errors.Wrap(err, "error unmarshaling revoked certificate info")
+	}
+	return &rci, nil
 }
 
 // GetRevokedCertificates gets a list of all revoked certificates.
@@ -494,6 +524,7 @@ type MockAuthDB struct {
 	MIsSSHRevoked           func(string) (bool, error)
 	MRevoke                 func(rci *RevokedCertificateInfo) error
 	MRevokeSSH              func(rci *RevokedCertificateInfo) error
+	MGetRevokedCertificate  func(serialNumber string) (*RevokedCertificateInfo, error)
 	MGetCertificate         func(serialNumber string) (*x509.Certificate, error)
 	MGetCertificateData     func(serialNumber string) (*CertificateData, error)
 	MStoreCertificate       func(crt *x509.Certificate) error
@@ -569,6 +600,17 @@ func (m *MockAuthDB) RevokeSSH(rci *RevokedCertificateInfo) error {
 		return m.MRevokeSSH(rci)
 	}
 	return m.Err
+}
+
+// GetRevokedCertificate mock.
+func (m *MockAuthDB) GetRevokedCertificate(serialNumber string) (*RevokedCertificateInfo, error) {
+	if m.MGetRevokedCertificate != nil {
+		return m.MGetRevokedCertificate(serialNumber)
+	}
+	if rci, ok := m.Ret1.(*RevokedCertificateInfo); ok {
+		return rci, m.Err
+	}
+	return nil, m.Err
 }
 
 // GetCertificate mock.

@@ -554,6 +554,26 @@ func (a *Authority) storeRenewedCertificate(oldCert *x509.Certificate, fullchain
 	}
 }
 
+// Markers for the entry through which a certificate was revoked for the
+// first time. They are stored on the revocation record and reported back on
+// repeated (idempotent) revocations of the same serial number.
+const (
+	// RevocationSourceUnknown is reported for revocation records that don't
+	// record a source, e.g. records created by older versions.
+	RevocationSourceUnknown = "unknown"
+	// RevocationSourceToken marks a revocation performed with a provisioner
+	// token.
+	RevocationSourceToken = "token"
+	// RevocationSourceMTLS marks a certificate revoking itself over mTLS.
+	RevocationSourceMTLS = "mtls"
+	// RevocationSourceACMEAccountKey marks a revocation requested by an ACME
+	// account, with the request signed using the account key.
+	RevocationSourceACMEAccountKey = "acme_account_key"
+	// RevocationSourceACMECertificateKey marks a revocation requested with a
+	// JWS signed with the revoked certificate's private key.
+	RevocationSourceACMECertificateKey = "acme_certificate_key"
+)
+
 // RevokeOptions are the options for the Revoke API.
 type RevokeOptions struct {
 	Serial      string
@@ -564,15 +584,27 @@ type RevokeOptions struct {
 	ACME        bool
 	Crt         *x509.Certificate
 	OTT         string
+
+	// Source is the entry through which the revocation is requested. It is
+	// stored with the first revocation record and reported to repeated
+	// revocation requests.
+	Source string
 }
 
 // Revoke revokes a certificate.
+//
+// Revocation is idempotent: revoking a serial number that was already
+// revoked succeeds and returns the information stored by the first
+// revocation (time, reason code and source entry), with alreadyRevoked set
+// to true. The first record is never modified and no additional side
+// effects (CAS revocation or CRL rebuild) are performed for repeated
+// requests.
 //
 // NOTE: Only supports passive revocation - prevent existing certificates from
 // being renewed.
 //
 // TODO: Add OCSP and CRL support.
-func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error {
+func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) (*db.RevokedCertificateInfo, bool, error) {
 	opts := []any{
 		errs.WithKeyVal("serialNumber", revokeOpts.Serial),
 		errs.WithKeyVal("reasonCode", revokeOpts.ReasonCode),
@@ -594,37 +626,26 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 		Reason:     revokeOpts.Reason,
 		MTLS:       revokeOpts.MTLS,
 		ACME:       revokeOpts.ACME,
+		Source:     revokeOpts.Source,
 		RevokedAt:  time.Now().UTC(),
-	}
-
-	// For X509 CRLs attempt to get the expiration date of the certificate.
-	if provisioner.MethodFromContext(ctx) == provisioner.RevokeMethod {
-		if revokeOpts.Crt == nil {
-			cert, err := a.db.GetCertificate(revokeOpts.Serial)
-			if err == nil {
-				rci.ExpiresAt = cert.NotAfter
-			}
-		} else {
-			rci.ExpiresAt = revokeOpts.Crt.NotAfter
-		}
 	}
 
 	// If not mTLS nor ACME, then get the TokenID of the token.
 	if !revokeOpts.MTLS && !revokeOpts.ACME {
 		token, err := jose.ParseSigned(revokeOpts.OTT)
 		if err != nil {
-			return errs.Wrap(http.StatusUnauthorized, err, "authority.Revoke; error parsing token", opts...)
+			return nil, false, errs.Wrap(http.StatusUnauthorized, err, "authority.Revoke; error parsing token", opts...)
 		}
 
 		// Get claims w/out verification.
 		var claims Claims
 		if err = token.UnsafeClaimsWithoutVerification(&claims); err != nil {
-			return errs.Wrap(http.StatusUnauthorized, err, "authority.Revoke", opts...)
+			return nil, false, errs.Wrap(http.StatusUnauthorized, err, "authority.Revoke", opts...)
 		}
 
 		// Verify that the serial in the token matches the serial from the request.
 		if revokeOpts.Serial != claims.Subject {
-			return errs.ApplyOptions(
+			return nil, false, errs.ApplyOptions(
 				errs.Forbidden(
 					"request serial number %q and token subject %q do not match",
 					revokeOpts.Serial, claims.Subject,
@@ -635,12 +656,12 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 		// This method will also validate the audiences for JWK provisioners.
 		p, err := a.LoadProvisionerByToken(token, &claims.Claims)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		rci.ProvisionerID = p.GetID()
 		rci.TokenID, err = p.GetTokenID(revokeOpts.OTT)
 		if err != nil && !errors.Is(err, provisioner.ErrAllowTokenReuse) {
-			return errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke; could not get ID for token")
+			return nil, false, errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke; could not get ID for token")
 		}
 		opts = append(opts,
 			errs.WithKeyVal("provisionerID", rci.ProvisionerID),
@@ -668,48 +689,99 @@ func (a *Authority) Revoke(ctx context.Context, revokeOpts *RevokeOptions) error
 
 	if provisioner.MethodFromContext(ctx) == provisioner.SSHRevokeMethod {
 		if err := a.revokeSSH(nil, rci); err != nil {
-			return failRevoke(err)
+			return nil, false, failRevoke(err)
+		}
+		return nil, false, nil
+	}
+
+	// Revoking an already revoked serial is idempotent: return the record
+	// stored by the first revocation and don't perform any additional side
+	// effect (CAS revocation or CRL rebuild). This runs after the token and
+	// provisioner checks above, so authorization is never relaxed for
+	// repeated requests. A missing record and a persistence layer that is
+	// not configured are both ignored here; the latter results in the same
+	// "not implemented" error as before when attempting to write.
+	if existing, err := a.getRevokedCertificate(rci.Serial); err == nil {
+		if existing != nil {
+			normalizeRevocationSource(existing)
+			return existing, true, nil
+		}
+	} else if !errors.Is(err, database.ErrNotFound) && !errors.Is(err, db.ErrNotImplemented) {
+		return nil, false, errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
+	}
+
+	// For X509 CRLs attempt to get the expiration date of the certificate.
+	if revokeOpts.Crt == nil {
+		if cert, err := a.db.GetCertificate(revokeOpts.Serial); err == nil {
+			rci.ExpiresAt = cert.NotAfter
 		}
 	} else {
-		// Revoke an X.509 certificate using CAS. If the certificate is not
-		// provided we will try to read it from the db. If the read fails we
-		// won't throw an error as it will be responsibility of the CAS
-		// implementation to require a certificate.
-		var revokedCert *x509.Certificate
-		if revokeOpts.Crt != nil {
-			revokedCert = revokeOpts.Crt
-		} else if rci.Serial != "" {
-			revokedCert, _ = a.db.GetCertificate(rci.Serial)
-		}
+		rci.ExpiresAt = revokeOpts.Crt.NotAfter
+	}
 
-		// CAS operation, note that SoftCAS (default) is a noop.
-		// The revoke happens when this is stored in the db.
-		_, err := a.x509CAService.RevokeCertificate(&casapi.RevokeCertificateRequest{
-			Certificate:  revokedCert,
-			SerialNumber: rci.Serial,
-			Reason:       rci.Reason,
-			ReasonCode:   rci.ReasonCode,
-			PassiveOnly:  revokeOpts.PassiveOnly,
-		})
-		if err != nil {
-			return errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
-		}
+	// Revoke an X.509 certificate using CAS. If the certificate is not
+	// provided we will try to read it from the db. If the read fails we
+	// won't throw an error as it will be responsibility of the CAS
+	// implementation to require a certificate.
+	var revokedCert *x509.Certificate
+	if revokeOpts.Crt != nil {
+		revokedCert = revokeOpts.Crt
+	} else if rci.Serial != "" {
+		revokedCert, _ = a.db.GetCertificate(rci.Serial)
+	}
 
-		// Save as revoked in the Db.
-		if err := a.revoke(revokedCert, rci); err != nil {
-			return failRevoke(err)
-		}
+	// CAS operation, note that SoftCAS (default) is a noop.
+	// The revoke happens when this is stored in the db.
+	if _, err := a.x509CAService.RevokeCertificate(&casapi.RevokeCertificateRequest{
+		Certificate:  revokedCert,
+		SerialNumber: rci.Serial,
+		Reason:       rci.Reason,
+		ReasonCode:   rci.ReasonCode,
+		PassiveOnly:  revokeOpts.PassiveOnly,
+	}); err != nil {
+		return nil, false, errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
+	}
 
-		// Generate a new CRL so CRL requesters will always get an up-to-date
-		// CRL whenever they request it.
-		if a.config.CRL.IsEnabled() && a.config.CRL.GenerateOnRevoke {
-			if err := a.GenerateCertificateRevocationList(); err != nil {
-				return errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
+	// Save as revoked in the Db. The compare-and-swap is the atomic guard
+	// against concurrent revocations: only the first request writes, the
+	// others receive ErrAlreadyExists and read back the first record.
+	if err := a.revoke(revokedCert, rci); err != nil {
+		if errors.Is(err, db.ErrAlreadyExists) {
+			if existing, getErr := a.getRevokedCertificate(rci.Serial); getErr == nil && existing != nil {
+				normalizeRevocationSource(existing)
+				return existing, true, nil
 			}
+		}
+		return nil, false, failRevoke(err)
+	}
+
+	// Generate a new CRL so CRL requesters will always get an up-to-date
+	// CRL whenever they request it. Only the first revocation reaches this
+	// point, so repeated revocations never trigger additional rebuilds.
+	if a.config.CRL.IsEnabled() && a.config.CRL.GenerateOnRevoke {
+		if err := a.GenerateCertificateRevocationList(); err != nil {
+			return nil, false, errs.Wrap(http.StatusInternalServerError, err, "authority.Revoke", opts...)
 		}
 	}
 
-	return nil
+	return rci, false, nil
+}
+
+// normalizeRevocationSource makes sure revocation records without a source
+// marker (such as records stored by older versions) are reported as unknown.
+func normalizeRevocationSource(rci *db.RevokedCertificateInfo) {
+	if rci.Source == "" {
+		rci.Source = RevocationSourceUnknown
+	}
+}
+
+func (a *Authority) getRevokedCertificate(sn string) (*db.RevokedCertificateInfo, error) {
+	if lca, ok := a.adminDB.(interface {
+		GetRevokedCertificate(string) (*db.RevokedCertificateInfo, error)
+	}); ok {
+		return lca.GetRevokedCertificate(sn)
+	}
+	return a.db.GetRevokedCertificate(sn)
 }
 
 func (a *Authority) revoke(crt *x509.Certificate, rci *db.RevokedCertificateInfo) error {

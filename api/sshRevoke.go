@@ -79,7 +79,7 @@ func SSHRevoke(w http.ResponseWriter, r *http.Request) {
 
 	opts.OTT = body.OTT
 
-	if err := a.Revoke(ctx, opts); err != nil {
+	if _, _, err := a.Revoke(ctx, opts); err != nil {
 		render.Error(w, r, errs.ForbiddenErr(err, "error revoking ssh certificate"))
 		return
 	}

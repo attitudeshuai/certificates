@@ -7,6 +7,7 @@ import (
 
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 )
 
 // Clock that returns time in UTC rounded to seconds.
@@ -24,7 +25,7 @@ type CertificateAuthority interface {
 	SignWithContext(ctx context.Context, cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
 	AreSANsAllowed(ctx context.Context, sans []string) error
 	IsRevoked(sn string) (bool, error)
-	Revoke(context.Context, *authority.RevokeOptions) error
+	Revoke(context.Context, *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error)
 	LoadProvisionerByName(string) (provisioner.Interface, error)
 	GetBackdate() *time.Duration
 }

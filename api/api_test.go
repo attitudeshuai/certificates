@@ -37,6 +37,7 @@ import (
 
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/logging"
 	"github.com/smallstep/certificates/templates"
@@ -205,6 +206,8 @@ type mockAuthority struct {
 	loadProvisionerByName        func(name string) (provisioner.Interface, error)
 	getProvisioners              func(nextCursor string, limit int) (provisioner.List, string, error)
 	revoke                       func(context.Context, *authority.RevokeOptions) error
+	revokedCertificate           *db.RevokedCertificateInfo
+	alreadyRevoked               bool
 	getEncryptedKey              func(kid string) (string, error)
 	getRoots                     func() ([]*x509.Certificate, error)
 	getIntermediateCertificates  func() []*x509.Certificate
@@ -309,11 +312,15 @@ func (m *mockAuthority) LoadProvisionerByName(name string) (provisioner.Interfac
 	return m.ret1.(provisioner.Interface), m.err
 }
 
-func (m *mockAuthority) Revoke(ctx context.Context, opts *authority.RevokeOptions) error {
+func (m *mockAuthority) Revoke(ctx context.Context, opts *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error) {
 	if m.revoke != nil {
-		return m.revoke(ctx, opts)
+		if err := m.revoke(ctx, opts); err != nil {
+			return nil, false, err
+		}
+	} else if m.err != nil {
+		return nil, false, m.err
 	}
-	return m.err
+	return m.revokedCertificate, m.alreadyRevoked, nil
 }
 
 func (m *mockAuthority) GetEncryptedKey(kid string) (string, error) {

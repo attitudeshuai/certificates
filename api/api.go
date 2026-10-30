@@ -31,6 +31,7 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/authority/provisioner"
+	"github.com/smallstep/certificates/db"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/internal/cast"
 	"github.com/smallstep/certificates/logging"
@@ -51,7 +52,7 @@ type Authority interface {
 	LoadProvisionerByCertificate(*x509.Certificate) (provisioner.Interface, error)
 	LoadProvisionerByName(string) (provisioner.Interface, error)
 	GetProvisioners(cursor string, limit int) (provisioner.List, string, error)
-	Revoke(context.Context, *authority.RevokeOptions) error
+	Revoke(context.Context, *authority.RevokeOptions) (*db.RevokedCertificateInfo, bool, error)
 	GetEncryptedKey(kid string) (string, error)
 	GetRoots() ([]*x509.Certificate, error)
 	GetIntermediateCertificates() []*x509.Certificate

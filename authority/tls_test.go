@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1526,6 +1527,7 @@ func TestAuthority_Revoke(t *testing.T) {
 		err             error
 		code            int
 		checkErrDetails func(err *errs.Error)
+		checkResult     func(rci *db.RevokedCertificateInfo, alreadyRevoked bool)
 	}
 	tests := map[string]func() test{
 		"fail/token/authorizeRevoke error": func() test {
@@ -1612,13 +1614,188 @@ func TestAuthority_Revoke(t *testing.T) {
 				},
 			}
 		},
-		"fail/already-revoked": func() test {
+		"ok/already-revoked-idempotent": func() test {
+			firstRevokedAt := now.Add(-time.Hour).UTC().Truncate(time.Second)
+			first := &db.RevokedCertificateInfo{
+				Serial:     "sn",
+				ReasonCode: 1,
+				Reason:     "key compromised",
+				RevokedAt:  firstRevokedAt,
+				Source:     RevocationSourceMTLS,
+			}
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+					assert.Equal(t, "sn", sn)
+					return first, nil
+				},
+				MRevoke: func(rci *db.RevokedCertificateInfo) error {
+					t.Fatal("first revocation record must not be overwritten")
+					return nil
+				},
+			}))
+
+			cl := jose.Claims{
+				Subject:   "sn",
+				Issuer:    validIssuer,
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+				ID:        "44",
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			require.NoError(t, err)
+
+			return test{
+				auth: _a,
+				ctx:  tlsRevokeCtx,
+				opts: &RevokeOptions{
+					// different reason code than the first revocation
+					Serial:     "sn",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					OTT:        raw,
+					Source:     RevocationSourceToken,
+				},
+				checkResult: func(rci *db.RevokedCertificateInfo, alreadyRevoked bool) {
+					assert.True(t, alreadyRevoked)
+					assert.Equal(t, "sn", rci.Serial)
+					assert.Equal(t, 1, rci.ReasonCode)
+					assert.Equal(t, "key compromised", rci.Reason)
+					assert.Equal(t, firstRevokedAt, rci.RevokedAt)
+					assert.Equal(t, RevocationSourceMTLS, rci.Source)
+				},
+			}
+		},
+		"ok/already-revoked-concurrent": func() test {
+			first := &db.RevokedCertificateInfo{
+				Serial:     "sn",
+				ReasonCode: 1,
+				Reason:     "key compromised",
+				RevokedAt:  now.Add(-time.Hour).UTC().Truncate(time.Second),
+				Source:     RevocationSourceACMEAccountKey,
+			}
+			reads := 0
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
 				MUseToken: func(id, tok string) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
 					return nil, errors.New("not found")
+				},
+				MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+					reads++
+					// the record doesn't exist before the write, but a
+					// concurrent request wins the write
+					if reads == 1 {
+						return nil, database.ErrNotFound
+					}
+					return first, nil
+				},
+				MRevoke: func(rci *db.RevokedCertificateInfo) error {
+					return db.ErrAlreadyExists
+				},
+			}))
+
+			cl := jose.Claims{
+				Subject:   "sn",
+				Issuer:    validIssuer,
+				NotBefore: jose.NewNumericDate(now),
+				Expiry:    jose.NewNumericDate(now.Add(time.Minute)),
+				Audience:  validAudience,
+				ID:        "44",
+			}
+			raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
+			require.NoError(t, err)
+
+			return test{
+				auth: _a,
+				ctx:  tlsRevokeCtx,
+				opts: &RevokeOptions{
+					Serial:     "sn",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					OTT:        raw,
+					Source:     RevocationSourceToken,
+				},
+				checkResult: func(rci *db.RevokedCertificateInfo, alreadyRevoked bool) {
+					assert.True(t, alreadyRevoked)
+					assert.Equal(t, RevocationSourceACMEAccountKey, rci.Source)
+					assert.Equal(t, 1, rci.ReasonCode)
+				},
+			}
+		},
+		"ok/already-revoked-unknown-source": func() test {
+			// record stored by an older version doesn't have a source marker
+			first := &db.RevokedCertificateInfo{
+				Serial:     "sn",
+				ReasonCode: 0,
+				RevokedAt:  now.Add(-time.Hour).UTC().Truncate(time.Second),
+			}
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+					return first, nil
+				},
+			}))
+
+			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+			require.NoError(t, err)
+
+			return test{
+				auth: _a,
+				ctx:  tlsRevokeCtx,
+				opts: &RevokeOptions{
+					Crt:        crt,
+					Serial:     "102012593071130646873265215610956555026",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					MTLS:       true,
+					Source:     RevocationSourceMTLS,
+				},
+				checkResult: func(rci *db.RevokedCertificateInfo, alreadyRevoked bool) {
+					assert.True(t, alreadyRevoked)
+					assert.Equal(t, RevocationSourceUnknown, rci.Source)
+				},
+			}
+		},
+		"fail/retrieving-revoked-certificate": func() test {
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+					return nil, errors.New("force")
+				},
+			}))
+
+			crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+			require.NoError(t, err)
+
+			return test{
+				auth: _a,
+				ctx:  tlsRevokeCtx,
+				opts: &RevokeOptions{
+					Crt:        crt,
+					Serial:     "102012593071130646873265215610956555026",
+					ReasonCode: reasonCode,
+					Reason:     reason,
+					MTLS:       true,
+				},
+				err:  errors.New("authority.Revoke: force"),
+				code: http.StatusInternalServerError,
+			}
+		},
+		"fail/already-revoked-without-record": func() test {
+			// write conflict, but the first record can't be read back: the
+			// original error type and status code are preserved
+			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+				MUseToken: func(id, tok string) (bool, error) {
+					return true, nil
+				},
+				MGetCertificate: func(sn string) (*x509.Certificate, error) {
+					return nil, errors.New("not found")
+				},
+				MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+					return nil, database.ErrNotFound
 				},
 				Err: db.ErrAlreadyExists,
 			}))
@@ -1645,11 +1822,6 @@ func TestAuthority_Revoke(t *testing.T) {
 				},
 				err:  errors.New("certificate with serial number 'sn' is already revoked"),
 				code: http.StatusBadRequest,
-				checkErrDetails: func(err *errs.Error) {
-					assert.Equal(t, raw, err.Details["token"])
-					assert.Equal(t, "44", err.Details["tokenID"])
-					assert.Equal(t, "step-cli:4UELJx8e0aS9m0CH3fZ0EB7D5aUPICb759zALHFejvc", err.Details["provisionerID"])
-				},
 			}
 		},
 		"fail/serial-number": func() test {
@@ -1815,7 +1987,8 @@ func TestAuthority_Revoke(t *testing.T) {
 	for name, f := range tests {
 		tc := f()
 		t.Run(name, func(t *testing.T) {
-			if err := tc.auth.Revoke(tc.ctx, tc.opts); err != nil {
+			rci, alreadyRevoked, err := tc.auth.Revoke(tc.ctx, tc.opts)
+			if err != nil {
 				if assert.NotNil(t, tc.err, fmt.Sprintf("unexpected error: %s", err)) {
 					var sc render.StatusCodedError
 					require.True(t, errors.As(err, &sc), "error does not implement StatusCodedError interface")
@@ -1836,6 +2009,9 @@ func TestAuthority_Revoke(t *testing.T) {
 				}
 			} else {
 				assert.Nil(t, tc.err)
+				if tc.checkResult != nil {
+					tc.checkResult(rci, alreadyRevoked)
+				}
 			}
 		})
 	}
@@ -2026,7 +2202,7 @@ func TestAuthority_CRL(t *testing.T) {
 				}
 				raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 				require.NoError(t, err)
-				err = a.Revoke(crlCtx, &RevokeOptions{
+				_, _, err = a.Revoke(crlCtx, &RevokeOptions{
 					Serial:     sn,
 					ReasonCode: reasonCode,
 					Reason:     reason,
@@ -2090,7 +2266,7 @@ func TestAuthority_CRL(t *testing.T) {
 				}
 				raw, err := jose.Signed(sig).Claims(cl).CompactSerialize()
 				require.NoError(t, err)
-				err = a.Revoke(crlCtx, &RevokeOptions{
+				_, _, err = a.Revoke(crlCtx, &RevokeOptions{
 					Serial:     sn,
 					ReasonCode: zeroReasonCode,
 					Reason:     reason,
@@ -2137,6 +2313,173 @@ func TestAuthority_CRL(t *testing.T) {
 			assert.Equal(t, tc.expected, cmpList)
 		})
 	}
+}
+
+// TestAuthority_Revoke_concurrent verifies that concurrent revocations of the
+// same serial number result in a single stored record: one request performs
+// the first revocation and all others receive the same first revocation
+// information.
+func TestAuthority_Revoke_concurrent(t *testing.T) {
+	crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+	require.NoError(t, err)
+	serial := crt.SerialNumber.String()
+
+	var (
+		mu     sync.Mutex
+		stored *db.RevokedCertificateInfo
+		writes int
+	)
+	a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+		MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+			assert.Equal(t, serial, sn)
+			mu.Lock()
+			defer mu.Unlock()
+			if stored == nil {
+				return nil, database.ErrNotFound
+			}
+			cp := *stored
+			return &cp, nil
+		},
+		MRevoke: func(rci *db.RevokedCertificateInfo) error {
+			mu.Lock()
+			defer mu.Unlock()
+			writes++
+			if stored != nil {
+				return db.ErrAlreadyExists
+			}
+			cp := *rci
+			stored = &cp
+			return nil
+		},
+	}))
+
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.RevokeMethod)
+
+	const n = 20
+	type result struct {
+		rci            *db.RevokedCertificateInfo
+		alreadyRevoked bool
+	}
+	var wg sync.WaitGroup
+	results := make(chan result, n)
+	for i := range n {
+		wg.Add(1)
+		go func(rc int) {
+			defer wg.Done()
+			rci, alreadyRevoked, err := a.Revoke(ctx, &RevokeOptions{
+				Crt:        crt,
+				Serial:     serial,
+				ReasonCode: rc,
+				Reason:     "a repeated revocation",
+				MTLS:       true,
+				Source:     RevocationSourceMTLS,
+			})
+			require.NoError(t, err)
+			results <- result{rci: rci, alreadyRevoked: alreadyRevoked}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+
+	var first int
+	for res := range results {
+		if !res.alreadyRevoked {
+			first++
+		}
+		assert.True(t, res.rci != nil)
+		assert.Equal(t, stored.Serial, res.rci.Serial)
+		assert.Equal(t, stored.ReasonCode, res.rci.ReasonCode)
+		assert.Equal(t, stored.RevokedAt, res.rci.RevokedAt)
+		assert.Equal(t, RevocationSourceMTLS, res.rci.Source)
+	}
+	assert.Equal(t, 1, first, "exactly one request performs the first revocation")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.GreaterOrEqual(t, writes, 1, "at least one compare-and-swap write is attempted")
+}
+
+// TestAuthority_Revoke_rebuildOnce verifies that with CRL regeneration on
+// revoke enabled, repeated revocations of the same serial only trigger a
+// single CRL rebuild and never overwrite the first record.
+func TestAuthority_Revoke_rebuildOnce(t *testing.T) {
+	var (
+		revokedList []db.RevokedCertificateInfo
+		crlStore    db.CertificateRevocationListInfo
+		rebuilds    int
+	)
+	a := testAuthority(t, WithDatabase(&db.MockAuthDB{
+		MGetCertificate: func(sn string) (*x509.Certificate, error) {
+			return nil, errors.New("not found")
+		},
+		MGetRevokedCertificate: func(sn string) (*db.RevokedCertificateInfo, error) {
+			for i := range revokedList {
+				if revokedList[i].Serial == sn {
+					cp := revokedList[i]
+					return &cp, nil
+				}
+			}
+			return nil, database.ErrNotFound
+		},
+		MRevoke: func(rci *db.RevokedCertificateInfo) error {
+			revokedList = append(revokedList, *rci)
+			return nil
+		},
+		MGetRevokedCertificates: func() (*[]db.RevokedCertificateInfo, error) {
+			return &revokedList, nil
+		},
+		MGetCRL: func() (*db.CertificateRevocationListInfo, error) {
+			if rebuilds == 0 {
+				return nil, database.ErrNotFound
+			}
+			return &crlStore, nil
+		},
+		MStoreCRL: func(i *db.CertificateRevocationListInfo) error {
+			rebuilds++
+			crlStore = *i
+			return nil
+		},
+	}))
+	a.config.CRL = &config.CRLConfig{
+		Enabled:          true,
+		GenerateOnRevoke: true,
+	}
+
+	ctx := provisioner.NewContextWithMethod(context.Background(), provisioner.RevokeMethod)
+
+	crt, err := pemutil.ReadCertificate("./testdata/certs/foo.crt")
+	require.NoError(t, err)
+
+	first, alreadyRevoked, err := a.Revoke(ctx, &RevokeOptions{
+		Crt:        crt,
+		Serial:     "sn",
+		ReasonCode: 1,
+		Reason:     "key compromised",
+		MTLS:       true,
+		Source:     RevocationSourceMTLS,
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyRevoked)
+	assert.Equal(t, 1, first.ReasonCode)
+
+	// repeated revocation through a different entry with a different reason
+	// code: succeeds, returns the first record (no rewrite, no rebuild)
+	second, alreadyRevoked, err := a.Revoke(ctx, &RevokeOptions{
+		Crt:        crt,
+		Serial:     "sn",
+		ReasonCode: 4,
+		Reason:     "superseded",
+		ACME:       true,
+		Source:     RevocationSourceACMEAccountKey,
+	})
+	require.NoError(t, err)
+	assert.True(t, alreadyRevoked)
+	assert.Equal(t, first.RevokedAt, second.RevokedAt)
+	assert.Equal(t, 1, second.ReasonCode)
+	assert.Equal(t, RevocationSourceMTLS, second.Source)
+
+	assert.Equal(t, 1, len(revokedList), "a single revocation record is stored")
+	assert.Equal(t, 1, rebuilds, "the CRL is rebuilt only for the first revocation")
 }
 
 type notImplementedCAS struct{}
