@@ -31,6 +31,7 @@ import (
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/admin"
 	adminAPI "github.com/smallstep/certificates/authority/admin/api"
+	"github.com/smallstep/certificates/authority/admin/audit"
 	"github.com/smallstep/certificates/authority/config"
 	"github.com/smallstep/certificates/cas/apiv1"
 	"github.com/smallstep/certificates/db"
@@ -456,6 +457,10 @@ func (ca *CA) Run() error {
 		ca.runCompactJob()
 		return nil
 	})
+	eg.Go(func() error {
+		ca.runAuditRetentionJob()
+		return nil
+	})
 
 	if ca.insecureSrv != nil {
 		eg.Go(func() error {
@@ -745,5 +750,49 @@ func (ca *CA) runCompactJob() {
 func runCompact(c nosql.Compactor) {
 	for err := error(nil); err == nil; {
 		err = c.Compact(0.7)
+	}
+}
+
+// runAuditRetentionJob batch reclaims audit records older than the
+// configured retention period. It runs once at startup and then daily.
+// Audit records are append-only; this is the only path through which
+// records are removed.
+func (ca *CA) runAuditRetentionJob() {
+	adminDB := ca.auth.GetAdminDatabase()
+	if adminDB == nil {
+		return
+	}
+	store, ok := adminDB.(audit.Store)
+	if !ok {
+		return
+	}
+
+	runPurge := func() {
+		ctx := context.Background()
+		cutoff := time.Now().UTC().Add(-audit.DefaultRetention)
+		n, err := store.PurgeAuditRecords(ctx, cutoff)
+		if err != nil {
+			log.Printf("error purging expired audit records: %+v", err)
+			return
+		}
+		if n > 0 {
+			log.Printf("purged %d expired audit records", n)
+		}
+	}
+
+	// Purge expired records at start.
+	runPurge()
+
+	// Purge expired records every day.
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ca.compactStop:
+			return
+		case <-ticker.C:
+			runPurge()
+		}
 	}
 }

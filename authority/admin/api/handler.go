@@ -62,34 +62,37 @@ func Route(r api.Router, options ...RouterOption) {
 	}
 
 	authorityPolicyMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return authnz(enabledInStandalone(next))
+		return authnz(auditWrites(enabledInStandalone(next)))
 	}
 
 	provisionerPolicyMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return authnz(disabledInStandalone(loadProvisionerByName(next)))
+		return authnz(auditWrites(disabledInStandalone(loadProvisionerByName(next))))
 	}
 
 	acmePolicyMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return authnz(disabledInStandalone(loadProvisionerByName(requireEABEnabled(loadExternalAccountKey(next)))))
+		return authnz(auditWrites(disabledInStandalone(loadProvisionerByName(requireEABEnabled(loadExternalAccountKey(next))))))
 	}
 
 	webhookMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return authnz(loadProvisionerByName(next))
+		return authnz(auditWrites(loadProvisionerByName(next)))
 	}
+
+	// Audit
+	r.MethodFunc("GET", "/audit", authnz(GetAuditRecords))
 
 	// Provisioners
 	r.MethodFunc("GET", "/provisioners/{name}", authnz(GetProvisioner))
 	r.MethodFunc("GET", "/provisioners", authnz(GetProvisioners))
-	r.MethodFunc("POST", "/provisioners", authnz(CreateProvisioner))
-	r.MethodFunc("PUT", "/provisioners/{name}", authnz(UpdateProvisioner))
-	r.MethodFunc("DELETE", "/provisioners/{name}", authnz(DeleteProvisioner))
+	r.MethodFunc("POST", "/provisioners", authnz(auditWrites(CreateProvisioner)))
+	r.MethodFunc("PUT", "/provisioners/{name}", authnz(auditWrites(UpdateProvisioner)))
+	r.MethodFunc("DELETE", "/provisioners/{name}", authnz(auditWrites(DeleteProvisioner)))
 
 	// Admins
 	r.MethodFunc("GET", "/admins/{id}", authnz(GetAdmin))
 	r.MethodFunc("GET", "/admins", authnz(GetAdmins))
-	r.MethodFunc("POST", "/admins", authnz(CreateAdmin))
-	r.MethodFunc("PATCH", "/admins/{id}", authnz(UpdateAdmin))
-	r.MethodFunc("DELETE", "/admins/{id}", authnz(DeleteAdmin))
+	r.MethodFunc("POST", "/admins", authnz(auditWrites(CreateAdmin)))
+	r.MethodFunc("PATCH", "/admins/{id}", authnz(auditWrites(UpdateAdmin)))
+	r.MethodFunc("DELETE", "/admins/{id}", authnz(auditWrites(DeleteAdmin)))
 
 	// ACME responder
 	if router.acmeResponder != nil {

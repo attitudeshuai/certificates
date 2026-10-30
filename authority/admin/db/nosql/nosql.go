@@ -3,6 +3,7 @@ package nosql
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -18,20 +19,21 @@ var (
 
 // DB is a struct that implements the AdminDB interface.
 type DB struct {
-	db          nosqlDB.DB
-	authorityID string
+	db              nosqlDB.DB
+	authorityID     string
+	auditTablesOnce sync.Once
 }
 
 // New configures and returns a new Authority DB backend implemented using a nosql DB.
 func New(db nosqlDB.DB, authorityID string) (*DB, error) {
-	tables := [][]byte{adminsTable, provisionersTable, authorityPoliciesTable}
+	tables := [][]byte{adminsTable, provisionersTable, authorityPoliciesTable, auditRecordsTable, auditMetaTable}
 	for _, b := range tables {
 		if err := db.CreateTable(b); err != nil {
 			return nil, errors.Wrapf(err, "error creating table %s",
 				string(b))
 		}
 	}
-	return &DB{db, authorityID}, nil
+	return &DB{db: db, authorityID: authorityID}, nil
 }
 
 // save writes the new data to the database, overwriting the old data if it
