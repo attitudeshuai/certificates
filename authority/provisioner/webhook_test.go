@@ -1,6 +1,7 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -15,6 +16,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -557,7 +560,7 @@ func TestWebhook_Do(t *testing.T) {
 			requestID:     "reqID",
 			errStatusCode: 404,
 			serverErrMsg:  "item not found",
-			expectErr:     errors.New("Webhook server responded with 404"),
+			expectErr:     errors.New(`webhook "abc123" failed after 1 attempt: Webhook server responded with 404`),
 		},
 	}
 	for name, tc := range tests {
@@ -698,4 +701,461 @@ func TestWebhook_Validate(t *testing.T) {
 			tt.assertion(t, tt.webhook.Validate())
 		})
 	}
+}
+
+func TestWebhook_Validate_retryConfig(t *testing.T) {
+	base := func() *Webhook {
+		return &Webhook{Name: "devices", URL: "https://localhost:3000", Kind: "ENRICHING"}
+	}
+	tests := []struct {
+		name      string
+		mutate    func(w *Webhook)
+		assertion assert.ErrorAssertionFunc
+	}{
+		{"ok zero defaults", func(w *Webhook) {}, assert.NoError},
+		{"ok max retries", func(w *Webhook) { w.MaxRetries = maxMaxRetries }, assert.NoError},
+		{"ok backoff", func(w *Webhook) { w.RetryBackoff = &Duration{Duration: 250 * time.Millisecond} }, assert.NoError},
+		{"ok max backoff", func(w *Webhook) { w.RetryBackoff = &Duration{Duration: maxRetryBackoff} }, assert.NoError},
+		{"fail negative retries", func(w *Webhook) { w.MaxRetries = -1 }, assert.Error},
+		{"fail retries over cap", func(w *Webhook) { w.MaxRetries = maxMaxRetries + 1 }, assert.Error},
+		{"fail negative backoff", func(w *Webhook) { w.RetryBackoff = &Duration{Duration: -time.Second} }, assert.Error},
+		{"fail backoff over cap", func(w *Webhook) { w.RetryBackoff = &Duration{Duration: maxRetryBackoff + time.Second} }, assert.Error},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := base()
+			tt.mutate(w)
+			tt.assertion(t, w.Validate())
+		})
+	}
+}
+
+func TestWebhook_retryConfigNormalization(t *testing.T) {
+	tests := []struct {
+		name        string
+		maxRetries  int
+		backoff     *Duration
+		wantRetries int
+		wantBackoff time.Duration
+	}{
+		{"defaults", 0, nil, defaultMaxRetries, defaultRetryBackoff},
+		{"configured", 3, &Duration{Duration: 250 * time.Millisecond}, 3, 250 * time.Millisecond},
+		{"retries capped", maxMaxRetries + 50, nil, maxMaxRetries, defaultRetryBackoff},
+		{"negative retries defaults", -5, nil, defaultMaxRetries, defaultRetryBackoff},
+		{"backoff capped", 0, &Duration{Duration: maxRetryBackoff + time.Hour}, defaultMaxRetries, maxRetryBackoff},
+		{"zero/negative backoff defaults", 0, &Duration{Duration: 0}, defaultMaxRetries, defaultRetryBackoff},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &Webhook{MaxRetries: tt.maxRetries, RetryBackoff: tt.backoff}
+			assert.Equal(t, tt.wantRetries, w.retries())
+			assert.Equal(t, tt.wantBackoff, w.backoff())
+		})
+	}
+}
+
+func TestWebhook_JSONConfig(t *testing.T) {
+	// Old configuration fields (address template, kind, cert type) keep
+	// working and the new retry fields are picked up from the same document.
+	var w Webhook
+	err := json.Unmarshal([]byte(`{
+		"id": "abc123",
+		"name": "people",
+		"url": "https://localhost:3000/users/{{ .username }}",
+		"kind": "ENRICHING",
+		"certType": "ALL",
+		"maxRetries": 3,
+		"retryBackoff": "250ms"
+	}`), &w)
+	require.NoError(t, err)
+	assert.Equal(t, "people", w.Name)
+	assert.Equal(t, 3, w.MaxRetries)
+	require.NotNil(t, w.RetryBackoff)
+	assert.Equal(t, 250*time.Millisecond, w.RetryBackoff.Duration)
+	assert.NoError(t, w.Validate())
+
+	// A document without the new fields stays valid and gets the defaults.
+	var old Webhook
+	require.NoError(t, json.Unmarshal([]byte(`{
+		"name": "people",
+		"url": "https://localhost:3000",
+		"kind": "AUTHORIZING"
+	}`), &old))
+	assert.NoError(t, old.Validate())
+	assert.Equal(t, defaultMaxRetries, old.retries())
+	assert.Equal(t, defaultRetryBackoff, old.backoff())
+}
+
+func TestWebhookError(t *testing.T) {
+	err := &WebhookError{Name: "people", Attempts: 2, Err: io.EOF}
+	assert.Equal(t, `webhook "people" failed after 2 attempts: EOF`, err.Error())
+	assert.True(t, errors.Is(err, io.EOF))
+
+	// The webhook ID is reported when the name is empty.
+	err = &WebhookError{ID: "abc123", Attempts: 1, Err: http.ErrServerClosed}
+	assert.Equal(t, `webhook "abc123" failed after 1 attempt: http: Server closed`, err.Error())
+
+	var target *WebhookError
+	assert.True(t, errors.As(fmt.Errorf("outer: %w", err), &target))
+	assert.Equal(t, "abc123", target.ID)
+}
+
+// newRetryTestWebhook returns a webhook pointing at the given test server with
+// a short backoff so retry tests don't have to wait for the default delay.
+func newRetryTestWebhook(t *testing.T, name, url string, wh *Webhook) *Webhook {
+	t.Helper()
+	if wh == nil {
+		wh = &Webhook{}
+	}
+	wh.ID = "webhook-id-" + name
+	wh.Name = name
+	wh.URL = url
+	wh.Secret = "c2VjcmV0Cg=="
+	if wh.RetryBackoff == nil {
+		wh.RetryBackoff = &Duration{Duration: 10 * time.Millisecond}
+	}
+	return wh
+}
+
+func doTestRequest(t *testing.T, wh *Webhook, ctx context.Context) (*webhook.ResponseBody, error) {
+	t.Helper()
+	reqBody, err := webhook.NewRequestBody(webhook.WithX509CertificateRequest(parseCertificateRequest(t, "testdata/certs/ecdsa.csr")))
+	require.NoError(t, err)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return wh.DoWithContext(ctx, http.DefaultClient, httptransport.NoopWrapper(), reqBody, nil)
+}
+
+func assertWebhookError(t *testing.T, err error, name string, attempts int, causeContains string) *WebhookError {
+	t.Helper()
+	var whErr *WebhookError
+	require.True(t, errors.As(err, &whErr), "expected *WebhookError, got %T: %v", err, err)
+	assert.Equal(t, name, whErr.Name)
+	assert.Equal(t, attempts, whErr.Attempts)
+	if causeContains != "" {
+		require.Error(t, whErr.Err)
+		assert.Contains(t, whErr.Err.Error(), causeContains)
+	}
+	return whErr
+}
+
+func TestWebhook_DoWithContext_serverFailures(t *testing.T) {
+	t.Run("5xx retries once by default then stops with webhook identity", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		// MaxRetries left at zero: defaults to one retry, i.e. two attempts.
+		wh := newRetryTestWebhook(t, "people", ts.URL, nil)
+		start := time.Now()
+		_, err := doTestRequest(t, wh, nil)
+		assert.Less(t, time.Since(start), time.Second, "should use the configured short backoff")
+		assert.Equal(t, int64(2), hits.Load())
+		assertWebhookError(t, err, "people", 2, "Webhook server responded with 500")
+	})
+
+	t.Run("5xx stops after the configured number of attempts", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.Error(w, "boom", http.StatusBadGateway)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "devices", ts.URL, &Webhook{MaxRetries: 2})
+		_, err := doTestRequest(t, wh, nil)
+		assert.Equal(t, int64(3), hits.Load())
+		assertWebhookError(t, err, "devices", 3, "Webhook server responded with 502")
+	})
+
+	t.Run("429 is retried and a later success wins", func(t *testing.T) {
+		var (
+			hits       atomic.Int64
+			signatures []string
+			mu         sync.Mutex
+		)
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			mu.Lock()
+			signatures = append(signatures, r.Header.Get("X-Smallstep-Signature"))
+			mu.Unlock()
+			if hits.Load() == 1 {
+				http.Error(w, "rate limited", http.StatusTooManyRequests)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"data":{"role":"dba"},"allow":true}`)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, nil)
+		resp, err := doTestRequest(t, wh, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int64(2), hits.Load())
+		assert.Equal(t, map[string]any{"role": "dba"}, resp.Data)
+
+		// The signed request is sent verbatim on every attempt.
+		mu.Lock()
+		require.Len(t, signatures, 2)
+		assert.Equal(t, signatures[0], signatures[1])
+		mu.Unlock()
+	})
+
+	t.Run("4xx request error is not retried", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.Error(w, "not found", http.StatusNotFound)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, &Webhook{MaxRetries: 5})
+		_, err := doTestRequest(t, wh, nil)
+		assert.Equal(t, int64(1), hits.Load())
+		assertWebhookError(t, err, "people", 1, "Webhook server responded with 404")
+	})
+
+	t.Run("connection error is retried", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		ts.Close() // nothing is listening anymore
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, nil)
+		_, err := doTestRequest(t, wh, nil)
+		assertWebhookError(t, err, "people", 2, "")
+	})
+}
+
+func TestWebhook_DoWithContext_responseSizeLimit(t *testing.T) {
+	t.Run("response larger than the limit fails and is not retried", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			_, err := w.Write(bytes.Repeat([]byte("a"), int(maxResponseBodySize)+1))
+			assert.NoError(t, err)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, &Webhook{MaxRetries: 5})
+		_, err := doTestRequest(t, wh, nil)
+		assert.Equal(t, int64(1), hits.Load(), "oversized responses must not be retried")
+		assertWebhookError(t, err, "people", 1, "exceeds the maximum size")
+	})
+
+	t.Run("response exactly at the limit is accepted", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			prefix := []byte(`{"data":{"role":"dba"}`)
+			suffix := []byte("}")
+			padding := int(maxResponseBodySize) - len(prefix) - len(suffix)
+			require.Greater(t, padding, 0)
+			w.WriteHeader(http.StatusOK)
+			_, err := w.Write(prefix)
+			assert.NoError(t, err)
+			_, err = w.Write(bytes.Repeat([]byte(" "), padding))
+			assert.NoError(t, err)
+			_, err = w.Write(suffix)
+			assert.NoError(t, err)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, nil)
+		resp, err := doTestRequest(t, wh, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), hits.Load())
+		assert.Equal(t, map[string]any{"role": "dba"}, resp.Data)
+	})
+
+	t.Run("malformed json is not retried", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			fmt.Fprint(w, "not-json")
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, &Webhook{MaxRetries: 3})
+		_, err := doTestRequest(t, wh, nil)
+		assert.Equal(t, int64(1), hits.Load())
+		assertWebhookError(t, err, "people", 1, "")
+	})
+}
+
+func TestWebhook_DoWithContext_cancellation(t *testing.T) {
+	t.Run("canceled in-flight request is not attempted again", func(t *testing.T) {
+		var hits atomic.Int64
+		release := make(chan struct{})
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			// Block until the test releases the handler. The client cancels
+			// while the response is still in flight.
+			<-release
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, &Webhook{MaxRetries: 5})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+
+		start := time.Now()
+		_, err := doTestRequest(t, wh, ctx)
+		assert.Less(t, time.Since(start), 2*time.Second, "must return immediately on cancellation")
+		assert.Equal(t, int64(1), hits.Load(), "no second attempt after cancellation")
+		whErr := assertWebhookError(t, err, "people", 1, "")
+		assert.True(t, errors.Is(whErr, context.Canceled), "expected context.Canceled in error chain, got %v", err)
+
+		// Let the blocked handler finish so the test server can shut down.
+		close(release)
+		ts.Close()
+	})
+
+	t.Run("cancellation interrupts the backoff without another attempt", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		// Configure a long backoff so sleeping through it would blow the test
+		// timeout if it weren't interruptible.
+		wh := newRetryTestWebhook(t, "people", ts.URL, &Webhook{MaxRetries: 5, RetryBackoff: &Duration{Duration: 10 * time.Second}})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+
+		start := time.Now()
+		_, err := doTestRequest(t, wh, ctx)
+		assert.Less(t, time.Since(start), 2*time.Second, "backoff wait must be interrupted")
+		assert.Equal(t, int64(1), hits.Load(), "must not retry after cancellation during backoff")
+		whErr := assertWebhookError(t, err, "people", 1, "")
+		assert.True(t, errors.Is(whErr, context.Canceled), "expected context.Canceled in error chain, got %v", err)
+	})
+
+	t.Run("already canceled context performs no attempt", func(t *testing.T) {
+		var hits atomic.Int64
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+		}))
+		defer ts.Close()
+
+		wh := newRetryTestWebhook(t, "people", ts.URL, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := doTestRequest(t, wh, ctx)
+		assert.Equal(t, int64(0), hits.Load())
+		assertWebhookError(t, err, "people", 0, "")
+	})
+}
+
+func TestWebhookController_chain(t *testing.T) {
+	csrReq, err := webhook.NewRequestBody(webhook.WithX509CertificateRequest(parseCertificateRequest(t, "testdata/certs/ecdsa.csr")))
+	require.NoError(t, err)
+
+	t.Run("enrich attributes the failing webhook and keeps earlier data", func(t *testing.T) {
+		var firstHits, secondHits atomic.Int64
+		first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			firstHits.Add(1)
+			fmt.Fprint(w, `{"data":{"role":"bar"},"allow":true}`)
+		}))
+		defer first.Close()
+		second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondHits.Add(1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		defer second.Close()
+
+		data := x509util.TemplateData{}
+		wc := &WebhookController{
+			client:        http.DefaultClient,
+			wrapTransport: httptransport.NoopWrapper(),
+			TemplateData:  data,
+			webhooks: []*Webhook{
+				newRetryTestWebhook(t, "first", first.URL, nil),
+				newRetryTestWebhook(t, "second", second.URL, nil),
+			},
+		}
+		for _, wh := range wc.webhooks {
+			wh.Kind = linkedca.Webhook_ENRICHING.String()
+		}
+
+		err := wc.Enrich(context.Background(), csrReq)
+		assertWebhookError(t, err, "second", 2, "500")
+		assert.Equal(t, int64(1), firstHits.Load())
+		assert.Equal(t, int64(2), secondHits.Load())
+		// Earlier successful enrichment is still written back by name.
+		assert.Equal(t, x509util.TemplateData{"Webhooks": map[string]any{
+			"first": map[string]any{"role": "bar"},
+		}}, data)
+	})
+
+	t.Run("authorize passes only when every webhook allows", func(t *testing.T) {
+		var firstHits, secondHits atomic.Int64
+		first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			firstHits.Add(1)
+			fmt.Fprint(w, `{"allow":true}`)
+		}))
+		defer first.Close()
+		second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondHits.Add(1)
+			fmt.Fprint(w, `{"allow":true}`)
+		}))
+		defer second.Close()
+
+		wc := &WebhookController{
+			client:        http.DefaultClient,
+			wrapTransport: httptransport.NoopWrapper(),
+			webhooks: []*Webhook{
+				newRetryTestWebhook(t, "first", first.URL, nil),
+				newRetryTestWebhook(t, "second", second.URL, nil),
+			},
+		}
+		for _, wh := range wc.webhooks {
+			wh.Kind = linkedca.Webhook_AUTHORIZING.String()
+		}
+		assert.NoError(t, wc.Authorize(context.Background(), csrReq))
+		assert.Equal(t, int64(1), firstHits.Load())
+		assert.Equal(t, int64(1), secondHits.Load())
+	})
+
+	t.Run("authorize returns immediately on the first denial", func(t *testing.T) {
+		var firstHits, secondHits atomic.Int64
+		first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			firstHits.Add(1)
+			fmt.Fprint(w, `{"allow":false}`)
+		}))
+		defer first.Close()
+		second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			secondHits.Add(1)
+			fmt.Fprint(w, `{"allow":true}`)
+		}))
+		defer second.Close()
+
+		wc := &WebhookController{
+			client:        http.DefaultClient,
+			wrapTransport: httptransport.NoopWrapper(),
+			webhooks: []*Webhook{
+				newRetryTestWebhook(t, "first", first.URL, nil),
+				newRetryTestWebhook(t, "second", second.URL, nil),
+			},
+		}
+		for _, wh := range wc.webhooks {
+			wh.Kind = linkedca.Webhook_AUTHORIZING.String()
+		}
+		err := wc.Authorize(context.Background(), csrReq)
+		assert.Equal(t, ErrWebhookDenied, err)
+		assert.Equal(t, int64(1), firstHits.Load())
+		assert.Equal(t, int64(0), secondHits.Load(), "later webhooks must not be called after a denial")
+	})
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -29,8 +30,75 @@ import (
 
 var ErrWebhookDenied = errors.New("webhook server did not allow request")
 
+// Retry and timeout limits for webhook requests.
+const (
+	// webhookTimeout is the maximum duration of a single call to a webhook,
+	// including all of its retries.
+	webhookTimeout = 10 * time.Second
+
+	// defaultMaxRetries is the number of retries performed for a webhook when
+	// MaxRetries is not configured. It preserves the historical behavior of a
+	// single retry.
+	defaultMaxRetries = 1
+	// maxMaxRetries is the upper bound on the number of retries that can be
+	// configured for a webhook.
+	maxMaxRetries = 5
+
+	// defaultRetryBackoff is the duration waited between webhook attempts when
+	// RetryBackoff is not configured. It preserves the historical behavior of
+	// sleeping one second between attempts.
+	defaultRetryBackoff = time.Second
+	// maxRetryBackoff is the upper bound on the backoff duration that can be
+	// configured for a webhook.
+	maxRetryBackoff = 30 * time.Second
+
+	// maxResponseBodySize is the maximum number of bytes read from a webhook
+	// response body (1 MiB). Responses larger than this are treated as a
+	// failure instead of being silently truncated.
+	maxResponseBodySize int64 = 1 << 20
+)
+
 type WebhookSetter interface {
 	SetWebhook(string, any)
+}
+
+// WebhookError is returned when a request to a webhook fails. It carries the
+// webhook identifier, the number of attempts performed and the last error
+// encountered, so that failures of different webhooks in a chain can be
+// attributed. The last error can be unwrapped, keeping errors.Is and
+// errors.As working (e.g. for context.Canceled).
+type WebhookError struct {
+	// Name is the configured name of the webhook.
+	Name string
+	// ID is the configured identifier of the webhook.
+	ID string
+	// Attempts is the number of HTTP attempts performed. It is zero when the
+	// request could not be prepared (e.g. an invalid secret).
+	Attempts int
+	// Err is the error of the last attempt.
+	Err error
+}
+
+func (e *WebhookError) Error() string {
+	id := e.Name
+	if id == "" {
+		id = e.ID
+	}
+	if id == "" {
+		id = "(unnamed)"
+	}
+	return fmt.Sprintf("webhook %q failed after %s: %s", id, attemptWord(e.Attempts), e.Err)
+}
+
+func (e *WebhookError) Unwrap() error {
+	return e.Err
+}
+
+func attemptWord(attempts int) string {
+	if attempts == 1 {
+		return "1 attempt"
+	}
+	return fmt.Sprintf("%d attempts", attempts)
 }
 
 type WebhookController struct {
@@ -64,10 +132,9 @@ func (wc *WebhookController) Enrich(ctx context.Context, req *webhook.RequestBod
 			continue
 		}
 
-		whCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-		defer cancel() //nolint:gocritic // every request canceled with its own timeout
-
+		whCtx, cancel := context.WithTimeout(ctx, webhookTimeout)
 		resp, err := wh.DoWithContext(whCtx, wc.client, wc.wrapTransport, req, wc.TemplateData)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -103,10 +170,9 @@ func (wc *WebhookController) Authorize(ctx context.Context, req *webhook.Request
 			continue
 		}
 
-		whCtx, cancel := context.WithTimeout(ctx, time.Second*10)
-		defer cancel() //nolint:gocritic // every request canceled with its own timeout
-
+		whCtx, cancel := context.WithTimeout(ctx, webhookTimeout)
 		resp, err := wh.DoWithContext(whCtx, wc.client, wc.wrapTransport, req, wc.TemplateData)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -143,6 +209,56 @@ type Webhook struct {
 		Username string
 		Password string
 	} `json:"-"`
+
+	// MaxRetries is the maximum number of additional requests performed after
+	// the first one when a retryable failure (connection error, 5xx response
+	// or 429 response) occurs. When zero it defaults to defaultMaxRetries.
+	// Values above maxMaxRetries are rejected by Validate and capped at
+	// execution time. Each webhook in a chain keeps its own counter.
+	MaxRetries int `json:"maxRetries,omitempty"`
+
+	// RetryBackoff is the fixed duration waited between attempts. When nil it
+	// defaults to defaultRetryBackoff. Values above maxRetryBackoff are
+	// rejected by Validate and capped at execution time. The wait is
+	// interrupted when the request context is canceled.
+	RetryBackoff *Duration `json:"retryBackoff,omitempty"`
+}
+
+// retries returns the normalized number of retries for the webhook.
+func (w *Webhook) retries() int {
+	switch {
+	case w.MaxRetries <= 0:
+		return defaultMaxRetries
+	case w.MaxRetries > maxMaxRetries:
+		return maxMaxRetries
+	default:
+		return w.MaxRetries
+	}
+}
+
+// backoff returns the normalized backoff duration for the webhook.
+func (w *Webhook) backoff() time.Duration {
+	d := defaultRetryBackoff
+	if w.RetryBackoff != nil && w.RetryBackoff.Duration > 0 {
+		d = w.RetryBackoff.Duration
+	}
+	if d > maxRetryBackoff {
+		return maxRetryBackoff
+	}
+	return d
+}
+
+// errorf wraps err in a WebhookError attributed to the webhook.
+func (w *Webhook) errorf(attempts int, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &WebhookError{
+		Name:     w.Name,
+		ID:       w.ID,
+		Attempts: attempts,
+		Err:      err,
+	}
 }
 
 // Validate validates a webhook, only name, url and kind are required.
@@ -181,6 +297,22 @@ func (w *Webhook) Validate() error {
 		return errors.New("webhook kind is invalid")
 	}
 
+	// retries
+	if w.MaxRetries < 0 {
+		return errors.New("webhook maxRetries cannot be negative")
+	}
+	if w.MaxRetries > maxMaxRetries {
+		return errors.Errorf("webhook maxRetries must be at most %d", maxMaxRetries)
+	}
+	if w.RetryBackoff != nil {
+		if w.RetryBackoff.Duration < 0 {
+			return errors.New("webhook retryBackoff cannot be negative")
+		}
+		if w.RetryBackoff.Duration > maxRetryBackoff {
+			return errors.Errorf("webhook retryBackoff must be at most %s", maxRetryBackoff)
+		}
+	}
+
 	return nil
 }
 
@@ -191,11 +323,11 @@ type TransportWrapper = httptransport.Wrapper
 func (w *Webhook) DoWithContext(ctx context.Context, client HTTPClient, tw TransportWrapper, reqBody *webhook.RequestBody, data any) (*webhook.ResponseBody, error) {
 	tmpl, err := template.New("url").Funcs(templates.StepFuncMap()).Parse(w.URL)
 	if err != nil {
-		return nil, err
+		return nil, w.errorf(0, err)
 	}
 	buf := &bytes.Buffer{}
 	if err := tmpl.Execute(buf, data); err != nil {
-		return nil, err
+		return nil, w.errorf(0, err)
 	}
 	webhookURL := buf.String()
 
@@ -214,40 +346,22 @@ func (w *Webhook) DoWithContext(ctx context.Context, client HTTPClient, tw Trans
 
 	reqBody.Timestamp = time.Now()
 
+	// The request body and its signature are computed once and sent verbatim
+	// on every attempt.
 	reqBytes, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, err
+		return nil, w.errorf(0, err)
 	}
 
-	retries := 1
-retry:
-
-	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(reqBytes))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	if requestID, ok := requestid.FromContext(ctx); ok {
-		req.Header.Set("X-Request-Id", requestID)
-	}
-
+	// An invalid signature secret is a configuration error; retrying will
+	// not fix it, so fail before any attempt is made.
 	secret, err := base64.StdEncoding.DecodeString(w.Secret)
 	if err != nil {
-		return nil, err
+		return nil, w.errorf(0, err)
 	}
-	h := hmac.New(sha256.New, secret)
-	h.Write(reqBytes)
-	sig := h.Sum(nil)
-	req.Header.Set("X-Smallstep-Signature", hex.EncodeToString(sig))
-	req.Header.Set("X-Smallstep-Webhook-ID", w.ID)
-
-	if w.BearerToken != "" {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", w.BearerToken))
-	} else if w.BasicAuth.Username != "" || w.BasicAuth.Password != "" {
-		req.SetBasicAuth(w.BasicAuth.Username, w.BasicAuth.Password)
-	}
+	sig := hmac.New(sha256.New, secret)
+	sig.Write(reqBytes)
+	signature := hex.EncodeToString(sig.Sum(nil))
 
 	if w.DisableTLSClientAuth {
 		var transport *http.Transport
@@ -266,35 +380,114 @@ retry:
 			Transport: tw(transport),
 		}
 	}
+
+	maxAttempts := w.retries() + 1
+	backoff := w.backoff()
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Do not start a new attempt when the caller already canceled the
+		// request or its deadline passed.
+		if err := ctx.Err(); err != nil {
+			return nil, w.errorf(attempt-1, err)
+		}
+
+		respBody, retryable, err := w.doRequest(ctx, client, webhookURL, reqBytes, signature)
+		if err == nil {
+			return respBody, nil
+		}
+		lastErr = err
+
+		// A request error (4xx), a context cancellation, an oversized or
+		// invalid response, or an exhausted retry budget is not retried.
+		if !retryable || attempt == maxAttempts {
+			return nil, w.errorf(attempt, err)
+		}
+
+		// Wait for the fixed backoff, but return as soon as the context is
+		// canceled instead of sleeping through the whole delay.
+		select {
+		case <-ctx.Done():
+			return nil, w.errorf(attempt, ctx.Err())
+		case <-time.After(backoff):
+		}
+	}
+
+	return nil, w.errorf(maxAttempts, lastErr)
+}
+
+// doRequest performs a single POST to the webhook. It returns the parsed
+// response and, on failure, whether performing another attempt makes sense.
+// Only connection/transport errors, 5xx responses and 429 responses are
+// retryable; request errors, signature failures, context cancellations,
+// oversized and invalid responses are not.
+func (w *Webhook) doRequest(ctx context.Context, client HTTPClient, webhookURL string, reqBytes []byte, signature string) (*webhook.ResponseBody, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", webhookURL, bytes.NewReader(reqBytes))
+	if err != nil {
+		return nil, false, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	if requestID, ok := requestid.FromContext(ctx); ok {
+		req.Header.Set("X-Request-Id", requestID)
+	}
+
+	req.Header.Set("X-Smallstep-Signature", signature)
+	req.Header.Set("X-Smallstep-Webhook-ID", w.ID)
+
+	if w.BearerToken != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", w.BearerToken))
+	} else if w.BasicAuth.Username != "" || w.BasicAuth.Password != "" {
+		req.SetBasicAuth(w.BasicAuth.Username, w.BasicAuth.Password)
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
-		} else if retries > 0 {
-			retries--
-			time.Sleep(time.Second)
-			goto retry
+		// Caller cancellation or an expired context must return immediately
+		// and never trigger another attempt.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, false, err
 		}
-		return nil, err
+		// Any other transport failure is a connection class error, which is
+		// worth retrying.
+		return nil, true, err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			log.Printf("Failed to close body of response from %s", w.URL)
 		}
 	}()
-	if resp.StatusCode >= 500 && retries > 0 {
-		retries--
-		time.Sleep(time.Second)
-		goto retry
+
+	switch {
+	case resp.StatusCode == http.StatusTooManyRequests:
+		// Rate limited; the request may succeed after backing off.
+		return nil, true, fmt.Errorf("Webhook server responded with %d", resp.StatusCode)
+	case resp.StatusCode >= 500:
+		// Server error; retrying may help.
+		return nil, true, fmt.Errorf("Webhook server responded with %d", resp.StatusCode)
+	case resp.StatusCode >= 400:
+		// Client/request error (e.g. 400, 401 after signature verification
+		// failure, 403, 404); retrying will not change the outcome.
+		return nil, false, fmt.Errorf("Webhook server responded with %d", resp.StatusCode)
 	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("Webhook server responded with %d", resp.StatusCode)
+
+	// Read at most one byte more than the allowed size so that an oversized
+	// body can be detected instead of being silently truncated into a valid
+	// response.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodySize+1))
+	if err != nil {
+		// A failure while reading the body is a connection class error.
+		return nil, true, err
+	}
+	if int64(len(body)) > maxResponseBodySize {
+		return nil, false, fmt.Errorf("webhook response body exceeds the maximum size of %d bytes", maxResponseBodySize)
 	}
 
 	respBody := &webhook.ResponseBody{}
-	if err := json.NewDecoder(resp.Body).Decode(respBody); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, respBody); err != nil {
+		return nil, false, err
 	}
 
-	return respBody, nil
+	return respBody, false, nil
 }

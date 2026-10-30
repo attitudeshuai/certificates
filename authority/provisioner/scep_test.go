@@ -166,7 +166,7 @@ func Test_challengeValidationController_Validate(t *testing.T) {
 				challenge:       "wrong-secret-value",
 				transactionID:   "transaction-1",
 			},
-			expErr: errors.New("failed executing webhook request: illegal base64 data at input byte 0"),
+			expErr: errors.New(`failed executing webhook request: webhook "webhook-name-1" failed after 0 attempts: illegal base64 data at input byte 0`),
 		},
 		{
 			name: "fail/not-allowed",
@@ -450,7 +450,7 @@ func TestSCEP_ValidateChallenge(t *testing.T) {
 					},
 				},
 			},
-		}, nil, args{"webhook-challenge", "webhook-transaction-1"}, nil, errors.New("failed executing webhook request: illegal base64 data at input byte 0")},
+		}, nil, args{"webhook-challenge", "webhook-transaction-1"}, nil, errors.New(`failed executing webhook request: webhook "webhook-name-1" failed after 0 attempts: illegal base64 data at input byte 0`)},
 		{"ok/static-challenge", &SCEP{
 			Name:              "SCEP",
 			Type:              "SCEP",
