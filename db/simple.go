@@ -1,7 +1,9 @@
 package db
 
 import (
+	"context"
 	"crypto/x509"
+	"sort"
 	"sync"
 	"time"
 
@@ -71,22 +73,78 @@ func (s *SimpleDB) StoreCertificate(*x509.Certificate) error {
 	return ErrNotImplemented
 }
 
-type usedToken struct {
-	UsedAt int64  `json:"ua,omitempty"`
-	Token  string `json:"tok,omitempty"`
-}
-
-// UseToken returns a "NotImplemented" error.
-func (s *SimpleDB) UseToken(id, tok string) (bool, error) {
-	if _, ok := s.usedTokens.LoadOrStore(id, &usedToken{
+// UseToken stores the token, along with its expiry time, the first time it is
+// seen. It returns true if the token was successfully stored and false if the
+// token (or another token with the same id) was already present. As the
+// SimpleDB is not persisted, all the records are lost on restart and a token
+// is then considered unused again.
+func (s *SimpleDB) UseToken(id, tok string, expiresAt time.Time) (bool, error) {
+	rec := &usedToken{
 		UsedAt: time.Now().Unix(),
 		Token:  tok,
-	}); ok {
+	}
+	if !expiresAt.IsZero() {
+		rec.ExpiresAt = expiresAt.Unix()
+	}
+	if _, ok := s.usedTokens.LoadOrStore(id, rec); ok {
 		// Token already exists in DB.
 		return false, nil
 	}
 	// Successfully stored token.
 	return true, nil
+}
+
+// RecycleExpiredUsedTokens removes at most limit used token records that
+// expired before now. Records without an expiry time are never removed. As
+// for the persistent backends, deletions are performed in a single bounded
+// batch, oldest records first.
+func (s *SimpleDB) RecycleExpiredUsedTokens(_ context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+
+	cutoff := now.Unix()
+	expired := make([]expiredUsedToken, 0)
+	s.usedTokens.Range(func(key, value any) bool {
+		rec, ok := value.(*usedToken)
+		if !ok || rec.ExpiresAt == 0 || rec.ExpiresAt >= cutoff {
+			// Unknown record or no known expiry or still valid: keep it.
+			return true
+		}
+		id, _ := key.(string)
+		expired = append(expired, expiredUsedToken{
+			key:       []byte(id),
+			expiresAt: rec.ExpiresAt,
+		})
+		return true
+	})
+
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	sort.SliceStable(expired, func(i, j int) bool {
+		if expired[i].expiresAt != expired[j].expiresAt {
+			return expired[i].expiresAt < expired[j].expiresAt
+		}
+		return string(expired[i].key) < string(expired[j].key)
+	})
+	if len(expired) > limit {
+		expired = expired[:limit]
+	}
+
+	for _, e := range expired {
+		// CompareAndDelete guarantees that a record replaced between the
+		// listing and the deletion is not removed while still valid. Used
+		// token records are never replaced in practice.
+		v, ok := s.usedTokens.Load(string(e.key))
+		if !ok {
+			continue // already deleted
+		}
+		s.usedTokens.CompareAndDelete(string(e.key), v)
+	}
+
+	return len(expired), nil
 }
 
 // IsSSHHost returns a "NotImplemented" error.

@@ -287,7 +287,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 		"ok/mockNoSQLDB": func(t *testing.T) *authorizeTest {
 			_a := testAuthority(t)
 			_a.db = &db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 			}
@@ -310,7 +310,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 		"fail/mockNoSQLDB/error": func(t *testing.T) *authorizeTest {
 			_a := testAuthority(t)
 			_a.db = &db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return false, errors.New("force")
 				},
 			}
@@ -335,7 +335,7 @@ func TestAuthority_authorizeToken(t *testing.T) {
 		"fail/mockNoSQLDB/token-already-used": func(t *testing.T) *authorizeTest {
 			_a := testAuthority(t)
 			_a.db = &db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return false, nil
 				},
 			}
@@ -1234,7 +1234,7 @@ func TestAuthority_authorizeSSHRevoke(t *testing.T) {
 		MIsSSHRevoked: func(serial string) (bool, error) {
 			return false, nil
 		},
-		MUseToken: func(id, tok string) (bool, error) {
+		MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 			return true, nil
 		},
 	})}...)
@@ -1532,7 +1532,7 @@ func TestAuthority_AuthorizeRenewToken(t *testing.T) {
 	}))
 	a4 := testAuthority(t)
 	a4.db = &db.MockAuthDB{
-		MUseToken: func(id, tok string) (bool, error) {
+		MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 			return true, nil
 		},
 		MGetCertificateData: func(serialNumber string) (*db.CertificateData, error) {

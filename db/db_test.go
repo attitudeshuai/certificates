@@ -2,17 +2,25 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/nosql"
 	"github.com/smallstep/nosql/database"
 )
+
+func toJSON(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
 
 func TestIsRevoked(t *testing.T) {
 	tests := map[string]struct {
@@ -150,7 +158,7 @@ func TestUseToken(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			switch ok, err := tc.db.UseToken(tc.id, tc.tok); {
+			switch ok, err := tc.db.UseToken(tc.id, tc.tok, time.Now().Add(time.Hour)); {
 			case err != nil:
 				if assert.NotNil(t, tc.want.err) {
 					assert.HasPrefix(t, err.Error(), tc.want.err.Error())
@@ -163,6 +171,249 @@ func TestUseToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustUsedTokenValue(t *testing.T, tok string, expiresAt time.Time) []byte {
+	t.Helper()
+	b, err := marshalUsedToken(tok, expiresAt)
+	assert.FatalError(t, err)
+	return b
+}
+
+func TestDB_RecycleExpiredUsedTokens(t *testing.T) {
+	now := time.Now()
+	expiredVal := mustUsedTokenValue(t, "tok-expired", now.Add(-2*time.Hour))
+	olderVal := mustUsedTokenValue(t, "tok-older", now.Add(-3*time.Hour))
+	newestVal := mustUsedTokenValue(t, "tok-newest", now.Add(-time.Hour))
+	validVal := mustUsedTokenValue(t, "tok-valid", now.Add(time.Hour))
+	noExpVal := mustUsedTokenValue(t, "tok-noexp", time.Time{})
+
+	entries := []*database.Entry{
+		{Bucket: usedOTTTable, Key: []byte("expired"), Value: expiredVal},
+		{Bucket: usedOTTTable, Key: []byte("older"), Value: olderVal},
+		{Bucket: usedOTTTable, Key: []byte("newest"), Value: newestVal},
+		{Bucket: usedOTTTable, Key: []byte("valid"), Value: validVal},
+		{Bucket: usedOTTTable, Key: []byte("no-expiry"), Value: noExpVal},
+		// Record written with the old raw token format.
+		{Bucket: usedOTTTable, Key: []byte("legacy"), Value: []byte("eyJhbGciOiJSUzI1NiIsImtpZCI6Ik9sZCJ9.payload.sig")},
+	}
+
+	t.Run("ok", func(t *testing.T) {
+		var deleted []string
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				return entries, nil
+			},
+			MUpdate: func(tx *database.Tx) error {
+				for _, op := range tx.Operations {
+					assert.Equals(t, database.Delete, op.Cmd)
+					assert.Equals(t, string(usedOTTTable), string(op.Bucket))
+					deleted = append(deleted, string(op.Key))
+				}
+				return nil
+			},
+		}
+		d := &DB{mdb, true}
+
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 10)
+		assert.Nil(t, err)
+		assert.Equals(t, 3, n)
+		// Only expired records, oldest first; unexpired, no-expiry and legacy
+		// records are kept.
+		assert.Equals(t, `["older","expired","newest"]`, toJSON(deleted))
+	})
+
+	t.Run("ok/batch-limit", func(t *testing.T) {
+		var deleted []string
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				return entries, nil
+			},
+			MUpdate: func(tx *database.Tx) error {
+				for _, op := range tx.Operations {
+					deleted = append(deleted, string(op.Key))
+				}
+				return nil
+			},
+		}
+		d := &DB{mdb, true}
+
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 2)
+		assert.Nil(t, err)
+		assert.Equals(t, 2, n)
+		assert.Equals(t, `["older","expired"]`, toJSON(deleted))
+	})
+
+	t.Run("ok/no-expired", func(t *testing.T) {
+		listed := false
+		updated := false
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				listed = true
+				return []*database.Entry{
+					{Bucket: usedOTTTable, Key: []byte("valid"), Value: validVal},
+					{Bucket: usedOTTTable, Key: []byte("no-expiry"), Value: noExpVal},
+					{Bucket: usedOTTTable, Key: []byte("legacy"), Value: []byte("raw-token")},
+				}, nil
+			},
+			MUpdate: func(tx *database.Tx) error {
+				updated = true
+				return nil
+			},
+		}
+		d := &DB{mdb, true}
+
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 10)
+		assert.Nil(t, err)
+		assert.Equals(t, 0, n)
+		assert.True(t, listed)
+		assert.False(t, updated)
+	})
+
+	t.Run("fail/limit-not-positive", func(t *testing.T) {
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				t.Fatal("List should not be called")
+				return nil, nil
+			},
+		}
+		d := &DB{mdb, true}
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 0)
+		assert.Nil(t, err)
+		assert.Equals(t, 0, n)
+	})
+
+	t.Run("fail/context-canceled", func(t *testing.T) {
+		mdb := &MockNoSQLDB{}
+		d := &DB{mdb, true}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		n, err := d.RecycleExpiredUsedTokens(ctx, now, 10)
+		assert.NotNil(t, err)
+		assert.Equals(t, 0, n)
+	})
+
+	t.Run("fail/list-error", func(t *testing.T) {
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				return nil, errors.New("force")
+			},
+		}
+		d := &DB{mdb, true}
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 10)
+		assert.NotNil(t, err)
+		assert.HasPrefix(t, "error listing used tokens: force", err.Error())
+		assert.Equals(t, 0, n)
+	})
+
+	t.Run("fail/update-error", func(t *testing.T) {
+		mdb := &MockNoSQLDB{
+			MList: func(bucket []byte) ([]*database.Entry, error) {
+				return entries, nil
+			},
+			MUpdate: func(tx *database.Tx) error {
+				return errors.New("force")
+			},
+		}
+		d := &DB{mdb, true}
+		n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 10)
+		assert.NotNil(t, err)
+		assert.HasPrefix(t, "error deleting expired used tokens: force", err.Error())
+		assert.Equals(t, 0, n)
+	})
+}
+
+func TestDB_UsedTokenBadger(t *testing.T) {
+	dir := t.TempDir()
+	adb, err := New(&Config{Type: "badgerv2", DataSource: dir})
+	assert.FatalError(t, err)
+	d := adb.(*DB)
+
+	now := time.Now()
+	expiresAt := now.Add(time.Hour)
+
+	// First use succeeds, reuse within the validity period is rejected.
+	ok, err := d.UseToken("reuse-id", "token", expiresAt)
+	assert.FatalError(t, err)
+	assert.True(t, ok)
+	ok, err = d.UseToken("reuse-id", "token", expiresAt)
+	assert.FatalError(t, err)
+	assert.False(t, ok)
+
+	// The record is stored with its expiry time.
+	stored, err := d.Get(usedOTTTable, []byte("reuse-id"))
+	assert.FatalError(t, err)
+	var rec usedToken
+	assert.FatalError(t, json.Unmarshal(stored, &rec))
+	assert.Equals(t, "token", rec.Token)
+	assert.Equals(t, expiresAt.Unix(), rec.ExpiresAt)
+
+	// Records without an expiry time are stored as exp=0.
+	ok, err = d.UseToken("no-expiry", "token", time.Time{})
+	assert.FatalError(t, err)
+	assert.True(t, ok)
+
+	// Seed expired and still valid records and a legacy raw record.
+	assert.FatalError(t, d.Set(usedOTTTable, []byte("expired"), mustUsedTokenValue(t, "tok", now.Add(-time.Hour))))
+	assert.FatalError(t, d.Set(usedOTTTable, []byte("valid2"), mustUsedTokenValue(t, "tok", now.Add(time.Hour))))
+	assert.FatalError(t, d.Set(usedOTTTable, []byte("legacy"), []byte("raw-old-token")))
+
+	// Reopen the database: the used token must still be rejected.
+	assert.FatalError(t, d.Shutdown())
+	adb, err = New(&Config{Type: "badgerv2", DataSource: dir})
+	assert.FatalError(t, err)
+	d = adb.(*DB)
+
+	ok, err = d.UseToken("reuse-id", "token", expiresAt)
+	assert.FatalError(t, err)
+	assert.False(t, ok)
+
+	// Reclaim: expired records are deleted, unexpired, no-expiry and legacy
+	// records are kept.
+	n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 100)
+	assert.FatalError(t, err)
+	assert.Equals(t, 1, n)
+
+	_, err = d.Get(usedOTTTable, []byte("expired"))
+	assert.True(t, database.IsErrNotFound(err))
+	for _, id := range []string{"reuse-id", "no-expiry", "valid2", "legacy"} {
+		_, err = d.Get(usedOTTTable, []byte(id))
+		assert.Nil(t, err)
+		ok, err = d.UseToken(id, "token", expiresAt)
+		assert.FatalError(t, err)
+		assert.False(t, ok)
+	}
+
+	// Once deleted, the expired record is gone; a second reclamation is a
+	// no-op and does not touch the remaining records.
+	n, err = d.RecycleExpiredUsedTokens(context.Background(), now, 100)
+	assert.FatalError(t, err)
+	assert.Equals(t, 0, n)
+
+	assert.FatalError(t, d.Shutdown())
+}
+
+func TestDB_RecycleExpiredUsedTokensBadgerBatch(t *testing.T) {
+	dir := t.TempDir()
+	adb, err := New(&Config{Type: "badgerv2", DataSource: dir})
+	assert.FatalError(t, err)
+	d := adb.(*DB)
+	t.Cleanup(func() { _ = d.Shutdown() })
+
+	now := time.Now()
+	for _, id := range []string{"a", "b", "c", "d"} {
+		assert.FatalError(t, d.Set(usedOTTTable, []byte(id), mustUsedTokenValue(t, "tok", now.Add(-time.Hour))))
+	}
+
+	n, err := d.RecycleExpiredUsedTokens(context.Background(), now, 2)
+	assert.FatalError(t, err)
+	assert.Equals(t, 2, n)
+	n, err = d.RecycleExpiredUsedTokens(context.Background(), now, 2)
+	assert.FatalError(t, err)
+	assert.Equals(t, 2, n)
+	n, err = d.RecycleExpiredUsedTokens(context.Background(), now, 2)
+	assert.FatalError(t, err)
+	assert.Equals(t, 0, n)
 }
 
 // wrappedProvisioner implements raProvisioner and attProvisioner.

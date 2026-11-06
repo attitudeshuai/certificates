@@ -174,7 +174,7 @@ func TestAuthority_LoadProvisionerByCertificate(t *testing.T) {
 
 	a1 := testAuthority(t)
 	a1.db = &db.MockAuthDB{
-		MUseToken: func(id, tok string) (bool, error) {
+		MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 			return true, nil
 		},
 		MGetCertificateData: func(serialNumber string) (*db.CertificateData, error) {
@@ -207,7 +207,7 @@ func TestAuthority_LoadProvisionerByCertificate(t *testing.T) {
 
 	a3 := testAuthority(t)
 	a3.db = &db.MockAuthDB{
-		MUseToken: func(id, tok string) (bool, error) {
+		MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 			return true, nil
 		},
 		MGetCertificateData: func(serialNumber string) (*db.CertificateData, error) {

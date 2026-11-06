@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smallstep/assert"
@@ -359,4 +360,117 @@ func TestConfig_Audience(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUsedOTTConfig(t *testing.T) {
+	tests := map[string]struct {
+		cfg          *UsedOTTConfig
+		enabled      bool
+		interval     time.Duration
+		batchSize    int
+		validateErr string
+	}{
+		"nil": {
+			cfg:       nil,
+			enabled:   false,
+			interval:  DefaultUsedOTTInterval,
+			batchSize: DefaultUsedOTTBatchSize,
+		},
+		"disabled": {
+			cfg:       &UsedOTTConfig{},
+			enabled:   false,
+			interval:  DefaultUsedOTTInterval,
+			batchSize: DefaultUsedOTTBatchSize,
+		},
+		"enabled-defaults": {
+			cfg:       &UsedOTTConfig{Enabled: true},
+			enabled:   true,
+			interval:  DefaultUsedOTTInterval,
+			batchSize: DefaultUsedOTTBatchSize,
+		},
+		"enabled-custom": {
+			cfg: &UsedOTTConfig{
+				Enabled:   true,
+				Interval:  &provisioner.Duration{Duration: 5 * time.Minute},
+				BatchSize: 42,
+			},
+			enabled:   true,
+			interval:  5 * time.Minute,
+			batchSize: 42,
+		},
+		"bad-interval": {
+			cfg: &UsedOTTConfig{
+				Enabled:  true,
+				Interval: &provisioner.Duration{Duration: -1},
+			},
+			validateErr: "usedOTT.interval cannot be less than 0",
+		},
+		"bad-batch-size": {
+			cfg: &UsedOTTConfig{
+				Enabled:   true,
+				BatchSize: -1,
+			},
+			validateErr: "usedOTT.batchSize cannot be less than 0",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := tc.cfg.Validate()
+			if tc.validateErr != "" {
+				assert.NotNil(t, err)
+				assert.HasPrefix(t, tc.validateErr, err.Error())
+				return
+			}
+			assert.Nil(t, err)
+			assert.Equals(t, tc.enabled, tc.cfg.IsEnabled())
+			assert.Equals(t, tc.interval, tc.cfg.IntervalDuration())
+			assert.Equals(t, tc.batchSize, tc.cfg.CleanupBatchSize())
+		})
+	}
+}
+
+func TestConfigValidateUsedOTT(t *testing.T) {
+	maxjwk, err := jose.ReadKey("../testdata/secrets/max_pub.jwk")
+	assert.FatalError(t, err)
+	ac := &AuthConfig{
+		Provisioners: provisioner.List{
+			&provisioner.JWK{
+				Name: "Max",
+				Type: "JWK",
+				Key:  maxjwk,
+			},
+		},
+	}
+	base := func() *Config {
+		return &Config{
+			Address:          "127.0.0.1:443",
+			Root:             []string{"../testdata/secrets/root_ca.crt"},
+			IntermediateCert: "../testdata/secrets/intermediate_ca.crt",
+			IntermediateKey:  "../testdata/secrets/intermediate_ca_key",
+			DNSNames:         []string{"test.smallstep.com"},
+			Password:         "pass",
+			AuthorityConfig:  ac,
+		}
+	}
+
+	// Not configured: validation succeeds and records are retained as before.
+	c := base()
+	assert.Nil(t, c.Validate())
+	assert.False(t, c.UsedOTT.IsEnabled())
+
+	// Enabled with valid options.
+	c = base()
+	c.UsedOTT = &UsedOTTConfig{
+		Enabled:   true,
+		Interval:  &provisioner.Duration{Duration: time.Minute},
+		BatchSize: 10,
+	}
+	assert.Nil(t, c.Validate())
+
+	// Invalid options fail the configuration validation.
+	c = base()
+	c.UsedOTT = &UsedOTTConfig{Enabled: true, BatchSize: -1}
+	err = c.Validate()
+	assert.NotNil(t, err)
+	assert.HasPrefix(t, "usedOTT.batchSize cannot be less than 0", err.Error())
 }

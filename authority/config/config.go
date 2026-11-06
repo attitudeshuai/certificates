@@ -44,6 +44,12 @@ var (
 	// DefaultCRLExpiredDuration is the default duration in which expired
 	// certificates will remain in the CRL after expiration.
 	DefaultCRLExpiredDuration = time.Hour
+	// DefaultUsedOTTInterval is the default interval at which expired used
+	// one-time token records are reclaimed.
+	DefaultUsedOTTInterval = time.Hour
+	// DefaultUsedOTTBatchSize is the default maximum number of used
+	// one-time token records that are reclaimed in a single batch.
+	DefaultUsedOTTBatchSize = 1000
 	// GlobalProvisionerClaims is the default duration that expired certificates
 	// remain in the CRL after expiration.
 	GlobalProvisionerClaims = provisioner.Claims{
@@ -83,6 +89,7 @@ type Config struct {
 	Templates        *templates.Templates `json:"templates,omitempty"`
 	CommonName       string               `json:"commonName,omitempty"`
 	CRL              *CRLConfig           `json:"crl,omitempty"`
+	UsedOTT          *UsedOTTConfig       `json:"usedOTT,omitempty"`
 	MetricsAddress   string               `json:"metricsAddress,omitempty"`
 	SkipValidation   bool                 `json:"-"`
 
@@ -138,6 +145,60 @@ func (c *CRLConfig) TickerDuration() time.Duration {
 	}
 
 	return (c.CacheDuration.Duration / 3) * 2
+}
+
+// UsedOTTConfig represents the configuration options for the reclamation of
+// records stored in the used one-time token table. When it is not enabled,
+// records are kept indefinitely, as in previous versions.
+type UsedOTTConfig struct {
+	Enabled bool `json:"enabled"`
+	// Interval is the time between two reclamation runs.
+	Interval *provisioner.Duration `json:"interval,omitempty"`
+	// BatchSize is the maximum number of records that are removed in a single
+	// reclamation run.
+	BatchSize int `json:"batchSize,omitempty"`
+}
+
+// IsEnabled returns if the reclamation of used one-time token records is
+// enabled.
+func (c *UsedOTTConfig) IsEnabled() bool {
+	return c != nil && c.Enabled
+}
+
+// Validate validates the used one-time token configuration.
+func (c *UsedOTTConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+
+	if c.Interval != nil && c.Interval.Duration < 0 {
+		return errors.New("usedOTT.interval cannot be less than 0")
+	}
+
+	if c.BatchSize < 0 {
+		return errors.New("usedOTT.batchSize cannot be less than 0")
+	}
+
+	return nil
+}
+
+// IntervalDuration returns the interval between two reclamation runs. If the
+// interval is not configured, the default one is used.
+func (c *UsedOTTConfig) IntervalDuration() time.Duration {
+	if c != nil && c.Interval != nil && c.Interval.Duration > 0 {
+		return c.Interval.Duration
+	}
+	return DefaultUsedOTTInterval
+}
+
+// CleanupBatchSize returns the maximum number of records removed in a single
+// reclamation run. If the batch size is not configured, the default one is
+// used.
+func (c *UsedOTTConfig) CleanupBatchSize() int {
+	if c != nil && c.BatchSize > 0 {
+		return c.BatchSize
+	}
+	return DefaultUsedOTTBatchSize
 }
 
 // ASN1DN contains ASN1.DN attributes that are used in Subject and Issuer
@@ -374,6 +435,11 @@ func (c *Config) Validate() error {
 
 	// Validate crl config: nil is ok
 	if err := c.CRL.Validate(); err != nil {
+		return err
+	}
+
+	// Validate used one-time token cleanup config: nil is ok
+	if err := c.UsedOTT.Validate(); err != nil {
 		return err
 	}
 

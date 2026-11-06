@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -59,10 +60,25 @@ type AuthDB interface {
 	Revoke(rci *RevokedCertificateInfo) error
 	RevokeSSH(rci *RevokedCertificateInfo) error
 	GetCertificate(serialNumber string) (*x509.Certificate, error)
-	UseToken(id, tok string) (bool, error)
+	UseToken(id, tok string, expiresAt time.Time) (bool, error)
 	IsSSHHost(name string) (bool, error)
 	GetSSHHostPrincipals() ([]string, error)
 	Shutdown() error
+}
+
+// UsedTokenRecycler is implemented by databases that can reclaim the records
+// stored in the used one-time token table once the tokens cannot be used
+// anymore.
+type UsedTokenRecycler interface {
+	// RecycleExpiredUsedTokens removes at most limit used token records that
+	// expired before now. The records are deleted in a single, bounded
+	// transaction so that the database is not locked for a long time; if more
+	// than limit records are expired, the remaining ones are removed on
+	// subsequent calls. It returns the number of records that were removed.
+	//
+	// Records without an expiry time, including records written in the old raw
+	// token format, are considered still relevant and are never removed.
+	RecycleExpiredUsedTokens(ctx context.Context, now time.Time, limit int) (int, error)
 }
 
 type dbKey struct{}
@@ -401,15 +417,133 @@ func (db *DB) StoreRenewedCertificate(oldCert *x509.Certificate, chain ...*x509.
 	return nil
 }
 
+// usedToken is the representation of a record stored in the used_ott table.
+// Records written by older versions contain the raw token instead of this
+// JSON representation; they can always be read and are handled
+// conservatively by the reclamation process.
+type usedToken struct {
+	UsedAt    int64  `json:"ua,omitempty"`
+	Token     string `json:"tok,omitempty"`
+	ExpiresAt int64  `json:"exp,omitempty"`
+}
+
+// marshalUsedToken returns the JSON representation of the used token record.
+// A zero expiresAt means that the token has no known expiry time; the record
+// is then kept indefinitely, as it was before reclamation was introduced.
+func marshalUsedToken(tok string, expiresAt time.Time) ([]byte, error) {
+	rec := &usedToken{
+		UsedAt: time.Now().Unix(),
+		Token:  tok,
+	}
+	if !expiresAt.IsZero() {
+		rec.ExpiresAt = expiresAt.Unix()
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return nil, errors.Wrap(err, "error marshaling used token")
+	}
+	return b, nil
+}
+
 // UseToken returns true if we were able to successfully store the token for
-// for the first time, false otherwise.
-func (db *DB) UseToken(id, tok string) (bool, error) {
-	_, swapped, err := db.CmpAndSwap(usedOTTTable, []byte(id), nil, []byte(tok))
+// for the first time, false otherwise. The expiresAt indicates when the token
+// cannot be used anymore; it is stored alongside the token so that the record
+// can be safely reclaimed afterwards.
+func (db *DB) UseToken(id, tok string, expiresAt time.Time) (bool, error) {
+	rec, err := marshalUsedToken(tok, expiresAt)
+	if err != nil {
+		return false, errors.Wrapf(err, "error storing used token %s/%s",
+			string(usedOTTTable), id)
+	}
+
+	_, swapped, err := db.CmpAndSwap(usedOTTTable, []byte(id), nil, rec)
 	if err != nil {
 		return false, errors.Wrapf(err, "error storing used token %s/%s",
 			string(usedOTTTable), id)
 	}
 	return swapped, nil
+}
+
+// expiredUsedToken is a used token record that can be reclaimed.
+type expiredUsedToken struct {
+	key       []byte
+	expiresAt int64
+}
+
+// RecycleExpiredUsedTokens removes at most limit used token records that
+// expired before now. Records are deleted in a single, size-bounded
+// transaction and the oldest records are deleted first, so a single call
+// never holds the database for a long time. Records without an expiry time
+// and records stored using the old raw token format are never deleted.
+func (db *DB) RecycleExpiredUsedTokens(ctx context.Context, now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Wrap(err, "error recycling used tokens")
+	}
+
+	entries, err := db.List(usedOTTTable)
+	if err != nil {
+		return 0, errors.Wrap(err, "error listing used tokens")
+	}
+
+	// Select the records that expired before now. Anything that cannot be
+	// decoded, or that has no expiry time, is left untouched.
+	cutoff := now.Unix()
+	expired := make([]expiredUsedToken, 0, len(entries))
+	for _, e := range entries {
+		var rec usedToken
+		if err := json.Unmarshal(e.Value, &rec); err != nil {
+			// Old record format, the expiry is unknown: keep it.
+			continue
+		}
+		if rec.ExpiresAt == 0 || rec.ExpiresAt >= cutoff {
+			// No known expiry or still valid: keep it.
+			continue
+		}
+		expired = append(expired, expiredUsedToken{
+			key:       e.Key,
+			expiresAt: rec.ExpiresAt,
+		})
+	}
+
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	// Reclaim in batches, oldest records first.
+	sort.SliceStable(expired, func(i, j int) bool {
+		if expired[i].expiresAt != expired[j].expiresAt {
+			return expired[i].expiresAt < expired[j].expiresAt
+		}
+		return string(expired[i].key) < string(expired[j].key)
+	})
+	if len(expired) > limit {
+		expired = expired[:limit]
+	}
+
+	if err := ctx.Err(); err != nil {
+		return 0, errors.Wrap(err, "error recycling used tokens")
+	}
+
+	// A used token record is written once with a compare-and-swap on an empty
+	// key and it is never modified afterwards. The only other operation on the
+	// key is this reclamation, so the value read above cannot be replaced by an
+	// unexpired record between the listing and the deletion: a concurrent
+	// token reuse still sees the existing record and its compare-and-swap
+	// fails, and the key can only be deleted concurrently, for which the
+	// delete is idempotent. The whole batch is applied in one short,
+	// size-bounded transaction.
+	tx := new(database.Tx)
+	for _, e := range expired {
+		tx.Del(usedOTTTable, e.key)
+	}
+	if err := db.Update(tx); err != nil {
+		return 0, errors.Wrap(err, "error deleting expired used tokens")
+	}
+
+	return len(expired), nil
 }
 
 // IsSSHHost returns if a principal is present in the ssh hosts table.
@@ -497,7 +631,7 @@ type MockAuthDB struct {
 	MGetCertificate         func(serialNumber string) (*x509.Certificate, error)
 	MGetCertificateData     func(serialNumber string) (*CertificateData, error)
 	MStoreCertificate       func(crt *x509.Certificate) error
-	MUseToken               func(id, tok string) (bool, error)
+	MUseToken               func(id, tok string, expiresAt time.Time) (bool, error)
 	MIsSSHHost              func(principal string) (bool, error)
 	MStoreSSHCertificate    func(crt *ssh.Certificate) error
 	MGetSSHHostPrincipals   func() ([]string, error)
@@ -545,9 +679,9 @@ func (m *MockAuthDB) IsSSHRevoked(sn string) (bool, error) {
 }
 
 // UseToken mock.
-func (m *MockAuthDB) UseToken(id, tok string) (bool, error) {
+func (m *MockAuthDB) UseToken(id, tok string, expiresAt time.Time) (bool, error) {
 	if m.MUseToken != nil {
-		return m.MUseToken(id, tok)
+		return m.MUseToken(id, tok, expiresAt)
 	}
 	if m.Ret1 == nil {
 		return false, m.Err

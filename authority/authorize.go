@@ -93,7 +93,7 @@ func (a *Authority) authorizeToken(ctx context.Context, token string) (provision
 	// Store the token to protect against reuse unless it's skipped.
 	// If we cannot get a token id from the provisioner, just hash the token.
 	if !SkipTokenReuseFromContext(ctx) {
-		if err := a.UseToken(ctx, token, p); err != nil {
+		if err := a.UseToken(ctx, token, p, expiryTime(claims.Expiry)); err != nil {
 			return nil, err
 		}
 	}
@@ -138,7 +138,7 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	}
 
 	// Check that the token has not been used.
-	if err := a.UseToken(r.Context(), token, prov); err != nil {
+	if err := a.UseToken(r.Context(), token, prov, expiryTime(claims.Expiry)); err != nil {
 		return nil, admin.WrapError(admin.ErrorUnauthorizedType, err, "adminHandler.authorizeToken; error with reuse token")
 	}
 
@@ -191,14 +191,25 @@ func (a *Authority) AuthorizeAdminToken(r *http.Request, token string) (*linkedc
 	return adm, nil
 }
 
-// UseToken stores the token to protect against reuse.
+// expiryTime returns the time of the given JWT numeric date, or the zero time
+// if the token does not carry an expiry (exp) claim.
+func expiryTime(expiry *jose.NumericDate) time.Time {
+	if expiry == nil {
+		return time.Time{}
+	}
+	return expiry.Time()
+}
+
+// UseToken stores the token to protect against reuse. The expiresAt time is
+// stored with the record so that it can be reclaimed once the token cannot be
+// used anymore; a zero time indicates a token without an expiry claim.
 //
 // This method currently ignores most errors coming from the GetTokenID because
 // the token is already validated. But it should specifically ignore the errors
 // provisioner.ErrAllowTokenReuse, provisioner.ErrNotImplemented, and
 // provisioner.ErrTokenFlowNotSupported unless this latter one used in a renewal
 // flow without mTLS.
-func (a *Authority) UseToken(ctx context.Context, token string, prov provisioner.Interface) error {
+func (a *Authority) UseToken(ctx context.Context, token string, prov provisioner.Interface, expiresAt time.Time) error {
 	reuseKey, err := prov.GetTokenID(token)
 	if err != nil {
 		// Fail on ErrTokenFlowNotSupported but allow x5cInsecure renew token
@@ -214,7 +225,7 @@ func (a *Authority) UseToken(ctx context.Context, token string, prov provisioner
 		reuseKey = strings.ToLower(hex.EncodeToString(sum[:]))
 	}
 
-	ok, err := a.db.UseToken(reuseKey, token)
+	ok, err := a.db.UseToken(reuseKey, token, expiresAt)
 	if err != nil {
 		return errs.Wrap(http.StatusInternalServerError, err, "failed when attempting to store token")
 	}
@@ -426,7 +437,7 @@ func (a *Authority) AuthorizeRenewToken(ctx context.Context, ott string) (*x509.
 	if err != nil {
 		return nil, errs.Unauthorized("error validating renew token: cannot get provisioner from certificate")
 	}
-	if err := a.UseToken(ctx, ott, p); err != nil {
+	if err := a.UseToken(ctx, ott, p, expiryTime(claims.Expiry)); err != nil {
 		return nil, err
 	}
 

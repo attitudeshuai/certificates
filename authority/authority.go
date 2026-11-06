@@ -87,6 +87,10 @@ type Authority struct {
 	crlStopper chan struct{}
 	crlMutex   sync.Mutex
 
+	// Used one-time token reclamation vars
+	usedOTTTicker  *time.Ticker
+	usedOTTStopper chan struct{}
+
 	// If true, do not re-initialize
 	initOnce  bool
 	startTime time.Time
@@ -860,6 +864,12 @@ func (a *Authority) init() error {
 		}
 	}
 
+	// Start the reclamation of expired used one-time token records, if
+	// configured. Reclamation never fails the initialization of the
+	// authority: errors while reclaiming records only affect the reclamation
+	// and are retried on the next run, never the issuance of certificates.
+	a.startUsedOTTRecycler()
+
 	// JWT numeric dates are seconds.
 	a.startTime = time.Now().Truncate(time.Second)
 	// Set flag indicating that initialization has been completed, and should
@@ -941,6 +951,7 @@ func (a *Authority) Shutdown() error {
 		a.crlTicker.Stop()
 		close(a.crlStopper)
 	}
+	a.stopUsedOTTRecycler()
 
 	if err := a.keyManager.Close(); err != nil {
 		log.Printf("error closing the key manager: %v", err)
@@ -954,6 +965,7 @@ func (a *Authority) CloseForReload() {
 		a.crlTicker.Stop()
 		close(a.crlStopper)
 	}
+	a.stopUsedOTTRecycler()
 
 	if err := a.keyManager.Close(); err != nil {
 		log.Printf("error closing the key manager: %v", err)
@@ -1050,4 +1062,63 @@ func (a *Authority) startCRLGenerator() error {
 	}()
 
 	return nil
+}
+
+// startUsedOTTRecycler starts a background goroutine that periodically
+// reclaims expired records from the used one-time token table, one bounded
+// batch at a time. A failing run is only logged and retried on the next tick,
+// so reclamation issues can never affect token issuance. When the
+// reclamation is not configured, or when the database does not support it,
+// this is a no-op and records are retained as before.
+func (a *Authority) startUsedOTTRecycler() {
+	cfg := a.config.UsedOTT
+	if !cfg.IsEnabled() {
+		return
+	}
+
+	recycler, ok := a.db.(db.UsedTokenRecycler)
+	if !ok {
+		return
+	}
+
+	interval := cfg.IntervalDuration()
+	batchSize := cfg.CleanupBatchSize()
+
+	a.usedOTTStopper = make(chan struct{}, 1)
+	a.usedOTTTicker = time.NewTicker(interval)
+
+	recycle := func() {
+		n, err := recycler.RecycleExpiredUsedTokens(context.Background(), time.Now(), batchSize)
+		switch {
+		case err != nil:
+			log.Printf("error recycling expired used one-time tokens: %v", err)
+		case n > 0:
+			log.Printf("recycled %d expired used one-time token record(s)", n)
+		}
+	}
+
+	go func() {
+		// Reclaim once on startup in case the CA has been down for a while;
+		// only a single, bounded batch is processed per run.
+		recycle()
+		for {
+			select {
+			case <-a.usedOTTTicker.C:
+				recycle()
+			case <-a.usedOTTStopper:
+				return
+			}
+		}
+	}()
+}
+
+// stopUsedOTTRecycler stops the background used one-time token reclamation
+// loop, if it is running.
+func (a *Authority) stopUsedOTTRecycler() {
+	if a.usedOTTTicker != nil {
+		a.usedOTTTicker.Stop()
+		a.usedOTTTicker = nil
+		close(a.usedOTTStopper)
+		a.usedOTTStopper = nil
+	}
 }

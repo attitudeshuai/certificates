@@ -608,7 +608,7 @@ ZYtQ9Ot36qc=
 			auth := testAuthority(t)
 			auth.config.AuthorityConfig.Template = a.config.AuthorityConfig.Template
 			auth.db = &db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MStoreCertificate: func(crt *x509.Certificate) error {
@@ -894,7 +894,7 @@ ZYtQ9Ot36qc=
 			auth := testAuthority(t)
 			auth.config.AuthorityConfig.Template = a.config.AuthorityConfig.Template
 			auth.db = &db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MStoreCertificate: func(crt *x509.Certificate) error {
@@ -1574,7 +1574,7 @@ func TestAuthority_Revoke(t *testing.T) {
 		},
 		"fail/db-revoke": func() test {
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -1614,7 +1614,7 @@ func TestAuthority_Revoke(t *testing.T) {
 		},
 		"fail/already-revoked": func() test {
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -1654,7 +1654,7 @@ func TestAuthority_Revoke(t *testing.T) {
 		},
 		"fail/serial-number": func() test {
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -1690,7 +1690,7 @@ func TestAuthority_Revoke(t *testing.T) {
 		},
 		"ok/token": func() test {
 			_a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -1951,7 +1951,7 @@ func TestAuthority_CRL(t *testing.T) {
 	tests := map[string]func() test{
 		"fail/empty-crl": func() test {
 			a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -1985,7 +1985,7 @@ func TestAuthority_CRL(t *testing.T) {
 		},
 		"ok/crl-full": func() test {
 			a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
@@ -2049,7 +2049,7 @@ func TestAuthority_CRL(t *testing.T) {
 			var localRevokedList []db.RevokedCertificateInfo
 			var localCRLStore db.CertificateRevocationListInfo
 			a := testAuthority(t, WithDatabase(&db.MockAuthDB{
-				MUseToken: func(id, tok string) (bool, error) {
+				MUseToken: func(id, tok string, expiresAt time.Time) (bool, error) {
 					return true, nil
 				},
 				MGetCertificate: func(sn string) (*x509.Certificate, error) {
